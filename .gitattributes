@@ -1,0 +1,34 @@
+# Line endings are the repository's business, not each machine's.
+#
+# Without this file, correctness depends on every contributor having
+# core.autocrlf set the way the original author happened to have it. A CRLF
+# reconnect.sh reaches Linux with a shebang reading `#!/usr/bin/env bash\r`,
+# and `env` then looks for an interpreter literally named `bash\r`.
+* text=auto
+
+# The shell scripts are executed on Linux, so they are LF in the working tree
+# too -- not only in the committed blob.
+*.sh text eol=lf
+
+# Line-oriented files, pinned in the working tree as well as in the committed
+# blob for the same reason the scripts are: what you read locally should be what
+# the repository holds, not whatever core.autocrlf turned it into.
+#
+# These are read by git and by a person, not by the scripts. An earlier version
+# of this comment said the opposite -- "read by the scripts rather than by an
+# editor" -- which is a rationale a later edit would reason from and get wrong:
+# the file reconnect.sh actually parses is config.env, which is untracked and so
+# out of .gitattributes' reach entirely, and a CRLF one is tolerated anyway --
+# config_value() trims `[:space:]` from both ends of a value and a carriage
+# return is in that class. config.env.example is the file a person copies and
+# edits.
+#
+# That clause used to credit load_config() with stripping the CRLF. It does not,
+# and saying so here was the same stale attribution that had to be corrected in
+# reconnect.sh's own BOM comment: the `line="${line%$'\r'}"` statement it
+# described was deleted once it turned out to change the outcome of no input,
+# and naming the wrong function invites the next reader to narrow
+# config_value()'s trim on the belief that CRLF is handled somewhere else.
+manual-setup/config.env.example text eol=lf
+.gitignore text eol=lf
+.gitattributes text eol=lf

@@ -1,0 +1,7 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Security vulnerability
+    url: https://github.com/ArisMGGR/gen-InternetReconnector/security/advisories/new
+    about: >-
+      Please do not open a public issue for a security problem. Open a draft
+      advisory instead, which stays private until a fix is out. See SECURITY.md.

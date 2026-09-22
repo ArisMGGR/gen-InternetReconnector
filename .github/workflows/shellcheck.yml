@@ -1,0 +1,67 @@
+name: shellcheck
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  shellcheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # ubuntu-latest already ships shellcheck, so the install only has to fill in
+      # if a future runner image drops it. The version is printed either way, and
+      # that is the point: this is deliberately not pinned to a release, so when a
+      # new shellcheck adds a style-level rule and turns this job red with no
+      # change to the scripts, the version in the log is what makes the cause
+      # obvious. Pin it here if that trade stops being worth it.
+      - name: Install shellcheck
+        run: |
+          if ! command -v shellcheck >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install -y shellcheck
+          fi
+          shellcheck --version
+
+      - name: Run shellcheck
+        run: shellcheck --shell=bash --severity=style reconnect.sh manual-setup/install-cron.sh manual-setup/uninstall-cron.sh auto-setup.sh tests/run-tests.sh
+
+      # The scripts are run by cron and by hand, so a syntax error must never
+      # reach a tag. shellcheck does not catch everything bash -n does.
+      - name: Parse with bash
+        run: |
+          for f in reconnect.sh manual-setup/install-cron.sh manual-setup/uninstall-cron.sh auto-setup.sh tests/run-tests.sh; do
+            bash -n "$f"
+          done
+
+      # These have to be executable in a fresh clone, which means the mode has to
+      # be right in the index -- a chmod in the working tree is not enough, and a
+      # machine with core.fileMode=false will not notice the difference. The
+      # README's "test it once by hand" step runs ./reconnect.sh directly, and
+      # the workflow below runs ./tests/run-tests.sh the same way.
+      - name: Check the scripts are executable
+        run: |
+          for f in reconnect.sh manual-setup/install-cron.sh manual-setup/uninstall-cron.sh auto-setup.sh tests/run-tests.sh; do
+            test -x "$f" || { echo "$f is not executable"; exit 1; }
+          done
+
+      # CRLF in a shebang makes env look for an interpreter named "bash\r".
+      # .gitattributes is meant to prevent this; this is the check that it did.
+      - name: Check for CRLF line endings
+        run: |
+          if grep -rlU $'\r' -- *.sh manual-setup/*.sh tests/*.sh; then
+            echo "CRLF line endings found in a shell script"
+            exit 1
+          fi
+
+      # The suite stubs nmcli and crontab and works in temporary directories, so
+      # it needs no NetworkManager, no cron and no network -- everything it
+      # covers is text processing that would otherwise regress silently.
+      - name: Run the test suite
+        run: ./tests/run-tests.sh
