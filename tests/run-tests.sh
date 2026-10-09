@@ -126,7 +126,9 @@
 #     current value -- including the interval, which it must leave to
 #     install-cron.sh rather than defaulting to 5 and undoing the carry-over.
 #     Also that blanks inside an SSID or a password survive (`read` strips them
-#     without `IFS=`), that a password never reaches the terminal or the output,
+#     without `IFS=`), that a password is never printed in the output (and that
+#     its prompt is read with -s -- pinned on the source, because a pipe cannot
+#     observe terminal echo),
 #     that a configuration reconnect.sh rejects stops before the crontab is
 #     touched, and that running out of input is a stated failure rather than
 #     consent. `read -p` shows its prompt only on a terminal, so none of this
@@ -291,6 +293,16 @@
 #     job still reading the other file. Pinned on the config path, the log
 #     directory and a tuning value, with the environment still winning as the
 #     control, and the third copy of the marker held to the other two
+#   * the round-1 audit backlog: a mistyped password line containing '=' is
+#     reported without echoing the password; a `.lock` path that cannot be
+#     opened skips the lock instead of ending the run unlogged; a line of ours
+#     edited after the marker is reported on install and on --remove; another
+#     checkout whose path ends in this one's is neither adopted by auto-setup.sh
+#     nor purged by uninstall-cron.sh; the no-terminal purge refusal says a line
+#     is still installed when one is; auto-setup.sh refuses a machine with no
+#     crontab before the interview, prints the carry-over notes under its
+#     header (and still ahead of a refusal), names the installed interval at the
+#     interval prompt, and reports an unreadable day file in its own words
 #
 # This list is checked against the `section` headings below when either changes:
 # it had fallen three sections behind, and a coverage list that quietly
@@ -873,6 +885,30 @@ run_reconnect "$d"
 assert_eq "a line with no '=' fails the run" "FAIL" "$RC_LOG"
 assert_contains "the bad line's number is reported" "line 2" "$RC_OUT"
 assert_not_contains "the bad line's content is never echoed" "hunter2" "$RC_OUT"
+
+# The same mistyped line when the password itself contains '=' -- a base64-style
+# one ending in `==` is the usual shape. It has an '=', so it never reaches the
+# missing-'=' arm above: everything left of the first '=' became the "key", and
+# the unknown-setting error printed `unknown setting 'WIFI_PASSWORD "s3cr3tB64/Q'`,
+# nearly the whole password. A key that is not a plain setting name is now
+# reported by line number alone.
+d="$(new_case)"; printf 'WIFI_SSID="MyNet"\nWIFI_PASSWORD "s3cr3tB64/Q=="\n' > "$d/config.env"
+NM_ACTIVE_PROFILE="MyNet" NM_PROFILES="MyNet|MyNet" run_reconnect "$d"
+assert_eq "a mistyped password line containing '=' fails the run" "FAIL" "$RC_LOG"
+assert_contains "and is still reported as an unknown setting on its line" \
+    "line 2: unknown setting" "$RC_OUT"
+assert_not_contains "without echoing any of the password" "s3cr3tB64" "$RC_OUT"
+
+d="$(new_case)"; printf 'WIFI_SSID="MyNet"\nWIFI_PASSWORD: "Xk9pQ7=="\n' > "$d/config.env"
+NM_ACTIVE_PROFILE="MyNet" NM_PROFILES="MyNet|MyNet" run_reconnect "$d"
+assert_not_contains "nor with a ':' typed for the '='" "Xk9pQ7" "$RC_OUT"
+
+# The control: a key that *is* a plain name is still shown, since that is what
+# makes a typo like WIFI_TYPO obvious (pinned further down as well).
+d="$(new_case)"; printf 'WIFI_SSID="MyNet"\nWIFI_PASWORD="x=y"\n' > "$d/config.env"
+NM_ACTIVE_PROFILE="MyNet" NM_PROFILES="MyNet|MyNet" run_reconnect "$d"
+assert_contains "a misspelt setting name is still named" \
+    "unknown setting 'WIFI_PASWORD'" "$RC_OUT"
 
 # A key set twice used to be accepted in silence, with the last line winning --
 # so a file that plainly reads WIFI_SSID="Home" connected to whatever a
@@ -1647,6 +1683,34 @@ else
     fi
 fi
 
+# A lock path that cannot be opened is treated like a missing flock: the lock is
+# skipped and the run still records its one line. `touch` succeeds on a
+# directory, so a `.lock` that was one got past the guard and `exec 9>>` failed
+# under `set -e` -- exit 1, "Is a directory", and no log line at all.
+#
+# The failure is at the `exec`, before flock is ever invoked, so a stub flock
+# that always grants the lock is enough to reach it and lets this run on every
+# host, including the ones the overlap tests above skip on.
+fakeflock_bin="$TMP/fake-flock"
+mkdir -p "$fakeflock_bin"
+printf '#!/usr/bin/env bash\nexit 0\n' > "$fakeflock_bin/flock"
+chmod +x "$fakeflock_bin/flock"
+d="$(new_case)"; printf 'WIFI_SSID="MyNet"\n' > "$d/config.env"
+mkdir -p "$d/logs/.lock"
+PATH="$fakeflock_bin:$PATH" NM_ACTIVE_PROFILE="MyNet" NM_PROFILES="MyNet|MyNet" \
+    run_reconnect "$d"
+assert_eq "a lock path that is a directory does not end the run" "0" "$RC_STATUS"
+assert_eq "and the run still logs its outcome" "Wifi Good" "$RC_LOG"
+assert_not_contains "with no bash redirect diagnostic" "Is a directory" "$RC_OUT"
+
+# The control: the same stub with an ordinary lock path takes the lock path
+# normally, so the case above is not passing because the lock block is dead.
+d="$(new_case)"; printf 'WIFI_SSID="MyNet"\n' > "$d/config.env"
+PATH="$fakeflock_bin:$PATH" NM_ACTIVE_PROFILE="MyNet" NM_PROFILES="MyNet|MyNet" \
+    run_reconnect "$d"
+assert_eq "an ordinary lock path still works with flock present" "Wifi Good" "$RC_LOG"
+assert_exists "and the lock file is created" "$d/logs/.lock"
+
 # =============================================================================
 section "log pruning"
 # =============================================================================
@@ -2110,6 +2174,41 @@ mv "$CRONTAB_FILE.edited" "$CRONTAB_FILE"
 run_install bash "$co/manual-setup/install-cron.sh" --remove
 assert_eq "--remove recognises a line with a trailing blank" \
     "0" "$(cron_count 'InternetReconnector')"
+
+# Text added *after* the marker. That line is deliberately not claimed -- a
+# command of the user's own can mention the marker mid-line, and deletion must
+# never take a line it cannot be sure it wrote -- but it used to be neither ours
+# nor foreign, so a re-install appended a second job beside it without a word and
+# the two ran every interval. It is reported now, on install and on --remove.
+d="$(new_case)"; co="$(new_checkout "$d")"
+export CRONTAB_FILE="$d/crontab.txt"
+: > "$CRONTAB_FILE"
+run_install bash "$co/manual-setup/install-cron.sh"
+printf '%s # my note\n' "$(cron_text)" > "$CRONTAB_FILE"
+edited="$(cron_text)"
+
+run_install bash "$co/manual-setup/install-cron.sh"
+assert_eq "a re-install over a line edited after the marker still succeeds" \
+    "0" "$CRON_STATUS"
+assert_contains "and says a line of this checkout's was left alone" \
+    "text was added after it" "$CRON_OUT"
+assert_contains "and that the script now runs from both" \
+    "now runs from both" "$CRON_OUT"
+assert_contains "and the edited line is still there, untouched" "$edited" "$(cron_text)"
+
+run_install bash "$co/manual-setup/install-cron.sh" --remove
+assert_contains "--remove reports the edited line it leaves" \
+    "text was added after it" "$CRON_OUT"
+assert_contains "and says it still runs" "It still runs" "$CRON_OUT"
+assert_eq "while the job it wrote is removed and the edited line kept" \
+    "$edited" "$(cron_text)"
+
+# The control: an ordinary re-install says nothing of the kind.
+: > "$CRONTAB_FILE"
+run_install bash "$co/manual-setup/install-cron.sh"
+run_install bash "$co/manual-setup/install-cron.sh"
+assert_not_contains "a plain re-install reports no edited line" \
+    "text was added after it" "$CRON_OUT"
 
 # The same tolerance at the other end of the line, which is a separate code path.
 # marked() has always ignored leading blanks and previous_value() is not anchored
@@ -3055,6 +3154,61 @@ assert_contains "and warns that the job is still installed" "is still installed"
 assert_contains "and says how to remove it" "crontab -e" "$CRON_OUT"
 assert_eq "and the line is left exactly as it was" "$edited" "$(cron_text)"
 
+# The same line with --purge-logs and no terminal. The refusal names what the run
+# did to the job, and it used to say "The cron job was removed" -- directly under
+# the WARNING that it was still installed -- because --remove exits 0 when it
+# leaves a line it does not recognise.
+mkdir -p "$d/logs"; touch "$d/logs/2026-01-01.log"
+CRON_OUT="$(RECONNECT_LOG_DIR="$d/logs" bash "$co/manual-setup/uninstall-cron.sh" --purge-logs < /dev/null 2>&1)"
+CRON_STATUS=$?
+assert_eq "a surviving line with --purge-logs and no terminal exits non-zero" \
+    "1" "$CRON_STATUS"
+assert_contains "and the refusal says a line is still installed" \
+    "A cron line is still installed" "$CRON_OUT"
+assert_not_contains "rather than claiming the job was removed" \
+    "The cron job was removed" "$CRON_OUT"
+assert_exists "and the logs are kept" "$d/logs/2026-01-01.log"
+
+# Another checkout whose absolute path *ends in* this one's -- /home/u/ir
+# inside /mnt/backup/home/u/ir. The path used to be matched as a bare
+# substring, so an uninstall from the shorter checkout claimed the other job,
+# exited 1 declaring it "still installed", and with --purge-logs read the other
+# job's log directory off its line and deleted its logs. The path is matched
+# quoted or as a whole word now, the rule install-cron.sh's ours() applies.
+d="$(new_case)"
+short_co="$d/ir"
+long_co="$d/backup$d/ir"
+copy_checkout_into "$short_co"
+copy_checkout_into "$long_co"
+export CRONTAB_FILE="$d/crontab.txt"
+: > "$CRONTAB_FILE"
+mkdir -p "$d/long-logs"; touch "$d/long-logs/2026-01-01.log"
+run_install env RECONNECT_LOG_DIR="$d/long-logs" bash "$long_co/manual-setup/install-cron.sh"
+long_line="$(cron_text)"
+assert_contains "the fixture's only job belongs to the longer checkout" \
+    "'$long_co/reconnect.sh'" "$long_line"
+
+run_install bash "$short_co/manual-setup/uninstall-cron.sh" --purge-logs --yes
+assert_eq "an uninstall from the shorter checkout finds nothing of its own" \
+    "0" "$CRON_STATUS"
+assert_contains "and says so" "No cron job found" "$CRON_OUT"
+assert_not_contains "rather than calling the other job still installed" \
+    "is still installed" "$CRON_OUT"
+assert_exists "and the other job's logs are not purged" "$d/long-logs/2026-01-01.log"
+assert_eq "and the other job is left in place" "$long_line" "$(cron_text)"
+
+# The control, and it is what stops the fix being "match nothing": the longer
+# checkout still finds and removes its own job, and a line of ours that a
+# hand-edit unquoted is still reported -- D7's looseness is kept.
+run_install bash "$long_co/manual-setup/uninstall-cron.sh"
+assert_eq "the longer checkout still removes its own job" \
+    "0" "$(cron_count 'InternetReconnector')"
+printf "*/5 * * * * PATH=/usr/bin %s/reconnect.sh >/dev/null 2>&1 # InternetReconnector\n" \
+    "$short_co" > "$CRONTAB_FILE"
+run_install bash "$short_co/manual-setup/uninstall-cron.sh" --dry-run
+assert_contains "and a hand-unquoted line of ours is still found" \
+    "Would remove the cron job" "$CRON_OUT"
+
 # A machine with no cron at all. "There is no cron job to remove" is the same
 # situation an ordinary second uninstall reports with exit 0, so answering it
 # with exit 1 because `crontab` is absent made the two halves of one answer
@@ -3264,9 +3418,19 @@ assert_contains "and the run says it tested the settings first" \
 # the summary reports only that one is set. This is the property SECURITY.md and
 # the house style both name, checked on the one script that handles the password
 # as a value rather than passing it through.
-assert_not_contains "the password is never echoed back" "hunter2" "$CRON_OUT"
+#
+# Two halves, because a pipe can only see one of them. The output assertion
+# pins that the script never *prints* the password. It cannot see terminal
+# echo -- stdin here is a pipe, and `read -s` changes nothing on a pipe -- so
+# with `-s` deleted it stayed green (measured: 742 passed, 0 failed). The echo
+# half is pinned on the source instead: the password prompt must be read with
+# `-s`. A shape check is the level this can be observed at without a pty.
+assert_not_contains "the password is never printed in the output" "hunter2" "$CRON_OUT"
 assert_contains "the summary says a password is set without showing it" \
     "WIFI_PASSWORD (set, not shown)" "$CRON_OUT"
+password_read="$(grep -c 'read -r -s -p "Wi-Fi password: "' "$AUTOSETUP")"
+assert_eq "and the password prompt is read with -s, so the terminal does not echo it" \
+    "1" "$password_read"
 
 # Blanks are meaningful in both of these and must survive exactly. `read` strips
 # leading and trailing blanks with the default IFS, so without `IFS=` a password
@@ -3307,7 +3471,7 @@ no
 assert_contains "a password of shell metacharacters reaches nmcli intact" \
     'password a"b$c`d#e ' "$(cat "$d/nmcli-args")"
 # shellcheck disable=SC2016
-assert_not_contains "and is still never printed" 'a"b$c' "$CRON_OUT"
+assert_not_contains "and is still never printed in the output" 'a"b$c' "$CRON_OUT"
 
 # An empty password is the documented answer for anyone relying on a saved
 # NetworkManager profile, and it has to stay empty rather than becoming the
@@ -4263,6 +4427,10 @@ assert_contains "and says it took the config path from the line" \
     "Using RECONNECT_CONFIG='$d/etc/config.env' from the installed cron job" "$CRON_OUT"
 assert_contains "and the log directory" \
     "Using RECONNECT_LOG_DIR='$d/etc/logs' from the installed cron job" "$CRON_OUT"
+# Under the script's own header, not above it: printed where they were
+# collected, these were the first lines of the run, ahead of its title.
+assert_contains "and those notes come after the script's header, not before it" \
+    "InternetReconnector setup" "${CRON_OUT%%Using RECONNECT_CONFIG=*}"
 assert_contains "and offers the config on that path as the current one" \
     "There is already a config at $d/etc/config.env" "$CRON_OUT"
 SETUP_CONFIG="$d/etc/config.env"
@@ -4282,9 +4450,15 @@ assert_eq "as one job" "1" "$(cron_count 'InternetReconnector$')"
 # The control: the environment still wins over the line, since that is the
 # documented way to move a setting. Without this the block above would pass
 # against a script that ignored the environment entirely.
+#
+# Five answers, the last an Enter for the interval. This fixture used to give
+# four and run out of input at the interval prompt, and it passed only because
+# end of input there was taken as "keep the default" -- F-018, the defect the
+# end-of-input block below now pins.
 mkdir -p "$d/new"
 run_setup "$co" 'NewNet
 pw
+
 
 
 ' env RECONNECT_CONFIG="$d/new/config.env" NM_ACTIVE_PROFILE="NewNet" \
@@ -4296,6 +4470,43 @@ assert_exists "the config goes where the environment says" "$d/new/config.env"
 assert_contains "and so does the job" "RECONNECT_CONFIG='$d/new/config.env'" "$(cron_text)"
 SETUP_CONFIG="$d/etc/config.env"
 assert_eq "while the line's old config is left alone" "OldNet" "$(config_setting WIFI_SSID)"
+
+# Holding the notes until the header must not lose them on a run refused before
+# the header: a refusal of a value carried off the line still has to say where
+# that value came from, so die() prints any note still held.
+d="$(new_case)"; co="$(new_checkout "$d")"
+export CRONTAB_FILE="$d/crontab.txt"
+printf "*/5 * * * * PATH='/usr/bin' RECONNECT_CONNECT_ATTEMPTS='nope' '%s/reconnect.sh' >/dev/null 2>&1 # InternetReconnector\n" \
+    "$co" > "$CRONTAB_FILE"
+run_setup "$co" "$setup_answers" env NM_ACTIVE_PROFILE="MyNet" \
+    NM_PROFILES="MyNet|MyNet" bash "$co/auto-setup.sh"
+assert_eq "a bad value carried off the line is refused up front" "1" "$CRON_STATUS"
+assert_contains "and the refusal still says it came from the installed job" \
+    "Using RECONNECT_CONNECT_ATTEMPTS='nope' from the installed cron job" "$CRON_OUT"
+assert_not_contains "before the interview has printed a word" \
+    "InternetReconnector setup" "$CRON_OUT"
+
+# Another checkout whose absolute path ends in this one's. The line was matched
+# on a bare substring of the path, so a plain run here adopted that job's
+# RECONNECT_CONFIG and rewrote *its* config.env with these answers, exit 0.
+d="$(new_case)"
+short_co="$d/ir"
+long_co="$d/backup$d/ir"
+copy_checkout_into "$short_co"
+copy_checkout_into "$long_co"
+export CRONTAB_FILE="$d/crontab.txt"; : > "$CRONTAB_FILE"
+mkdir -p "$d/long-etc"
+printf 'WIFI_SSID="LongNet"\nWIFI_PASSWORD="long-secret"\n' > "$d/long-etc/config.env"
+run_install env RECONNECT_CONFIG="$d/long-etc/config.env" \
+    bash "$long_co/manual-setup/install-cron.sh"
+run_setup "$short_co" "$setup_answers" env NM_ACTIVE_PROFILE="MyNet" \
+    NM_PROFILES="MyNet|MyNet" bash "$short_co/auto-setup.sh"
+assert_eq "a setup beside another checkout's job succeeds" "0" "$CRON_STATUS"
+assert_not_contains "without taking that job's settings" \
+    "from the installed cron job" "$CRON_OUT"
+SETUP_CONFIG="$d/long-etc/config.env"
+assert_eq "and that job's config is left alone" "long-secret" "$(config_setting WIFI_PASSWORD)"
+assert_exists "and this checkout's own config is written" "$short_co/config.env"
 
 # The marker is now written out three times. The two cron scripts are pinned
 # against each other in their own section; this holds the third copy to them.
@@ -4498,6 +4709,43 @@ assert_contains "and points at the by-hand route instead" "install-cron.sh" "$CR
 assert_missing "and nothing is written" "$co/config.env"
 assert_eq "and nothing is installed" "0" "$(cron_count 'InternetReconnector')"
 
+# The case above runs out of input at the very first prompt, which is read by
+# ask() in the main shell. Every prompt after the password is read through
+# ask_trimmed() instead, which always runs inside a command substitution -- and
+# bash clears `set -e` there, so ask()'s refusal used to end only the inner
+# subshell. ask_trimmed() then returned an empty reply with status 0, and every
+# caller read it as "take the default": measured, input ending after the
+# password printed "no more input" three times, then wrote config.env,
+# installed the job and exited 0. The first-prompt case could not see that,
+# because it never reaches ask_trimmed() at all.
+#
+# One case per trimmed prompt, since each is a separate call site: the
+# interface (with a device list, so it is the numbered-list prompt), the hidden
+# flag, and the interval. Asserted on no config.env and no job, because exit 0
+# plus an installed job is exactly what the defect produced.
+d="$(new_case)"; co="$(new_checkout "$d")"
+export CRONTAB_FILE="$d/crontab.txt"
+for eof_answers in 'MyNet\n\n' 'MyNet\n\nwlan0\n' 'MyNet\n\nwlan0\nno\n'; do
+    : > "$CRONTAB_FILE"
+    rm -f "$co/config.env"
+    run_setup "$co" "$eof_answers" "${eof_bound[@]}" NM_DEVICES="wlan0|wifi" \
+        NM_ACTIVE_PROFILE="MyNet" NM_PROFILES="MyNet|MyNet" bash "$co/auto-setup.sh"
+    assert_eq "running out of input after '$eof_answers' fails the setup" \
+        "1" "$CRON_STATUS"
+    assert_contains "and says it ran out of input" "no more input (end of file)" "$CRON_OUT"
+    assert_not_contains "rather than carrying on to the install" "Setup complete" "$CRON_OUT"
+    assert_missing "and nothing is written" "$co/config.env"
+    assert_eq "and nothing is installed" "0" "$(cron_count 'InternetReconnector')"
+done
+
+# The control: the same answers with the last one supplied complete normally,
+# so the cases above are refusing end of input and not the answers themselves.
+: > "$CRONTAB_FILE"
+run_setup "$co" 'MyNet\n\nwlan0\nno\n\n' env NM_DEVICES="wlan0|wifi" \
+    NM_ACTIVE_PROFILE="MyNet" NM_PROFILES="MyNet|MyNet" bash "$co/auto-setup.sh"
+assert_eq "with every answer given the same run completes" "0" "$CRON_STATUS"
+assert_eq "and installs the job" "1" "$(cron_count 'InternetReconnector$')"
+
 # The argument policy the other four scripts share. This one has no flags at all
 # beyond --help, so every other argument is unknown.
 d="$(new_case)"; co="$(new_checkout "$d")"
@@ -4586,6 +4834,83 @@ else
             "hunter2" "$(sed -n 's/^WIFI_PASSWORD="\(.*\)"$/\1/p' "$co/config.env.bak" | head -n 1)"
     fi
 fi
+
+# A machine with no crontab at all. That is the last thing a run needs, and it
+# was not checked until install-cron.sh refused at the very end -- after the
+# interview, the password, the config write and a passing verification. It is
+# refused before the first question now, like every other run that cannot
+# finish. The PATH is the no-crontab one the uninstall section builds.
+if [ "${nocrontab_ok:-0}" -ne 1 ]; then
+    printf '  skip no-crontab setup test: could not build a PATH without crontab\n'
+else
+    d="$(new_case)"; co="$(new_checkout "$d")"
+    run_setup "$co" "$setup_answers" env PATH="$nocrontab" bash "$co/auto-setup.sh"
+    assert_eq "a setup with no crontab command is refused" "1" "$CRON_STATUS"
+    assert_contains "and says which command is missing" "crontab not found" "$CRON_OUT"
+    assert_not_contains "before the interview has printed a word" \
+        "InternetReconnector setup" "$CRON_OUT"
+    assert_missing "and before config.env is written" "$co/config.env"
+fi
+
+# What Enter at the interval question means depends on whether a job is
+# installed, not on whether a config exists. The prompt tested the config, so
+# after installing first and configuring second -- an order install-cron.sh
+# anticipates with its "no config file yet" note -- it said "Press Enter for
+# every 5 minutes" and then installed the 10 already on the line.
+d="$(new_case)"; co="$(new_checkout "$d")"
+export CRONTAB_FILE="$d/crontab.txt"; : > "$CRONTAB_FILE"
+run_install env MINUTES=10 bash "$co/manual-setup/install-cron.sh"
+assert_missing "the fixture has a job but no config yet" "$co/config.env"
+run_setup "$co" 'MyNet
+pw
+
+no
+
+' env NM_ACTIVE_PROFILE="MyNet" NM_PROFILES="MyNet|MyNet" bash "$co/auto-setup.sh"
+assert_eq "a first setup over an installed job succeeds" "0" "$CRON_STATUS"
+assert_contains "and the interval prompt names the installed interval" \
+    "(every 10 minutes)" "$CRON_OUT"
+assert_not_contains "rather than promising the default" \
+    "Press Enter for every 5 minutes" "$CRON_OUT"
+assert_contains "and that interval is what stays installed" "*/10 * * * *" "$(cron_text)"
+
+# The control: with no job installed the default is what the prompt offers.
+d="$(new_case)"; co="$(new_checkout "$d")"
+export CRONTAB_FILE="$d/crontab.txt"; : > "$CRONTAB_FILE"
+run_setup "$co" 'MyNet
+pw
+
+no
+
+' env NM_ACTIVE_PROFILE="MyNet" NM_PROFILES="MyNet|MyNet" bash "$co/auto-setup.sh"
+assert_contains "with no job installed the prompt offers every 5 minutes" \
+    "Press Enter for every 5 minutes" "$CRON_OUT"
+assert_contains "and installs it" "*/5 * * * *" "$(cron_text)"
+
+# A day file that exists but cannot be read. reconnect.sh warns that it cannot
+# append and exits 0; the readback then failed on the redirect, and inside the
+# `verify_line=` assignment that ended the run under `set -e` with bash's own
+# "Permission denied", exit 1 and no stated reason, after config.env had been
+# written. It is read as "no line" now and reported as a run that could not be
+# confirmed. Self-skips where the filesystem does not enforce the mode.
+d="$(new_case)"; co="$(new_checkout "$d")"
+export CRONTAB_FILE="$d/crontab.txt"; : > "$CRONTAB_FILE"
+mkdir -p "$co/logs"
+locked_log="$co/logs/$(date '+%Y-%m-%d').log"
+printf '[00:00:00] Wifi Good\n' > "$locked_log"
+chmod 000 "$locked_log" 2>/dev/null
+if [ -r "$locked_log" ]; then
+    printf '  skip unreadable-day-file setup test: this filesystem does not enforce the mode\n'
+else
+    run_setup "$co" "$setup_answers" env NM_ACTIVE_PROFILE="MyNet" \
+        NM_PROFILES="MyNet|MyNet" bash "$co/auto-setup.sh"
+    assert_eq "an unreadable day file does not pass the verification" "1" "$CRON_STATUS"
+    assert_contains "and the run gives its own reason" "could not be confirmed" "$CRON_OUT"
+    assert_not_contains "rather than bash's redirect diagnostic" \
+        "Permission denied" "$CRON_OUT"
+    assert_eq "and nothing is installed" "0" "$(cron_count 'InternetReconnector')"
+fi
+chmod 644 "$locked_log" 2>/dev/null
 
 unset NM_DEVICES
 

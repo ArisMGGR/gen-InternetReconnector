@@ -240,10 +240,20 @@ fi
 # flock comes from util-linux and is not everywhere. Where it is missing the
 # lock is skipped and overlapping runs behave as they did before, which is why
 # install-cron.sh still warns about intervals shorter than the worst case.
+#
+# The descriptor is opened inside a guarded group, and a lock file that cannot
+# be opened is treated exactly like a missing flock: the lock is skipped and the
+# run goes on to record its outcome. The `exec` used to be bare, and `touch`
+# above succeeds on a *directory* -- so a `.lock` that was a directory (or any
+# other path `>>` cannot open) made `exec 9>>` fail under `set -e`: exit 1, a
+# bare "Is a directory" on stderr, and no log line at all, which breaks "each
+# run appends exactly one line". The `2>/dev/null` on the group is restored
+# when the group ends; the `exec` inside it is what makes descriptor 9 persist.
 if command -v flock >/dev/null 2>&1 \
     && mkdir -p "$LOG_DIR" 2>/dev/null \
-    && touch "$LOG_DIR/.lock" 2>/dev/null; then
-    exec 9>>"$LOG_DIR/.lock"
+    && touch "$LOG_DIR/.lock" 2>/dev/null \
+    && [ -f "$LOG_DIR/.lock" ] \
+    && { exec 9>>"$LOG_DIR/.lock"; } 2>/dev/null; then
     if ! flock -n 9; then
         # Log the skip rather than exiting silently. "Each run appends exactly
         # one line" is relied on when reading a day's log back: a run that
@@ -367,6 +377,24 @@ load_config() {
         # here, independently of what the prefix handling does.
         key="${key#"${key%%[![:space:]]*}"}"
         key="${key%"${key##*[![:space:]]}"}"
+        # A "key" that is not a plain setting name is never echoed back. The
+        # missing-'=' error below refuses to print its line because that line
+        # is most likely a mistyped password line -- but a password that itself
+        # contains '=' (a base64-style one ending in `==`, say) does not land
+        # there. `WIFI_PASSWORD "s3cr3tB64/Q=="` has an '=', so everything left
+        # of it became the key, and the unknown-setting error printed
+        # `unknown setting 'WIFI_PASSWORD "s3cr3tB64/Q'` -- nearly the whole
+        # password, on stderr, in the output the bug-report template asks
+        # people to paste. A real setting name is letters, digits and `_`, so
+        # anything else is reported by line number alone. The empty key is left
+        # to the unknown-setting arm, which prints '' and so shows nothing.
+        #
+        # Ahead of the duplicate check, whose message names the key too.
+        case "$key" in
+            '') ;;
+            [!A-Za-z_]* | *[!A-Za-z0-9_]*)
+                die "$CONFIG_FILE line $lineno: unknown setting (the text before the '=' is not a setting name, so it is not shown -- it may be part of a mistyped password line). Valid settings: WIFI_SSID, WIFI_PASSWORD, WIFI_IFACE, WIFI_HIDDEN." ;;
+        esac
         value="$(config_value "${line#*=}")"
         # A key set twice was silently accepted and the last line won. That is
         # the same silent-wrong-value outcome rejecting unknown keys exists to

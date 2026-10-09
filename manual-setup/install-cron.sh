@@ -424,13 +424,26 @@ function marked(line,   ml) {
     ml = length(marker)
     return length(line) >= ml && substr(line, length(line) - ml + 1) == marker
 }
-function ours(line,   i, n, f) {
-    if (!marked(line)) return 0
+function names_target(line,   i, n, f) {
     if (index(line, quoted_target) > 0) return 1
     n = split(line, f, /[[:space:]]+/)
     for (i = 1; i <= n; i++)
         if (f[i] == target) return 1
     return 0
+}
+function ours(line) {
+    return marked(line) && names_target(line)
+}
+# Runs the reconnect.sh of this checkout and carries the marker, but not at the
+# end: text was added after it by hand ("... # InternetReconnector # my note").
+# Such a line is not claimed -- a command of the user can mention it mid-line,
+# and deletion must never take a line it cannot be sure it wrote -- but it is
+# not ignored either. It used to be neither ours nor foreign, so a re-install
+# appended a second job beside it without a word and the two then ran every
+# interval. It is reported now; see warn_about_edited().
+function edited(line) {
+    if (line ~ /^[[:space:]]*#/) return 0
+    return !marked(line) && index(line, marker) > 0 && names_target(line)
 }
 BEGIN {
     marker = ENVIRON["MARKER"]
@@ -488,6 +501,13 @@ our_line() {
 # shellcheck disable=SC2016
 foreign_lines() {
     classify 'marked($0) && !ours($0) { print }' "$1"
+}
+
+# Lines of this checkout's that a hand-edit took past what ours() recognises.
+# Reported, never removed -- see edited() in CLASSIFY_AWK.
+# shellcheck disable=SC2016
+edited_lines() {
+    classify 'edited($0) { print }' "$1"
 }
 
 # Everything that is not one of our lines. Blank lines are kept: this is the
@@ -600,6 +620,31 @@ warn_about_foreign() {
     fi
 }
 
+# Warn about lines of ours that were edited after the marker. $2 is what this
+# run did about the job, so the note says what that means: on an install there
+# are now two jobs running this script; on a removal the edited one is still
+# there. Same one-printf-per-line rule as warn_about_foreign().
+warn_about_edited() {
+    local edited line
+    edited="$(edited_lines "$1")"
+    [ -n "$edited" ] || return 0
+    echo "NOTE: these cron lines run this checkout's reconnect.sh and carry our" >&2
+    echo "      marker, but text was added after it, so they are not recognised as" >&2
+    echo "      this script's own and were left untouched:" >&2
+    while IFS= read -r line; do
+        printf '        %s\n' "$line" >&2
+    done <<< "$edited"
+    case "$2" in
+        install)
+            echo "      The job was installed as well, so reconnect.sh now runs from both." >&2
+            echo "      Remove one with 'crontab -e'." >&2
+            ;;
+        *)
+            echo "      It still runs. Remove it by hand with 'crontab -e'." >&2
+            ;;
+    esac
+}
+
 # --- Remove ------------------------------------------------------------------
 if [ "$mode" = remove ]; then
     if has_ours "$current"; then
@@ -609,6 +654,7 @@ if [ "$mode" = remove ]; then
         echo "No InternetReconnector cron job found for $RECONNECT; nothing to remove."
     fi
     warn_about_foreign "$current"
+    warn_about_edited "$current" remove
     exit 0
 fi
 
@@ -781,8 +827,12 @@ validate_setting() {
             die "$what must be a whole number >= $min; got: '$value'" ;;
     esac
     # Ahead of the arithmetic, because the arithmetic is what silently accepts an
-    # over-wide value. The wording matches reconnect.sh's for the same setting, so
-    # the pair refuses the same values with the same reason. See fits_in_integer().
+    # over-wide value. The bound and the width rule are reconnect.sh's for the
+    # same setting, so the pair refuses the same values. The wording is the same
+    # for the two settings whose minimum is 1; for the two whose minimum is 0,
+    # reconnect.sh says "non-negative whole number of seconds/days" where this
+    # says ">= 0" -- the same rule in different words, and auto-setup.sh's
+    # check_setting() copies the wording used here. See fits_in_integer().
     fits_in_integer "$value" \
         || die "$what must be a whole number >= $min, at most 18 digits; got: '$value'"
     # Base 10 for the same reason validate_minutes() forces it: bash reads a
@@ -1082,6 +1132,7 @@ elif [ -n "$nmcli_dir" ]; then
 fi
 
 warn_about_foreign "$current"
+warn_about_edited "$current" install
 
 # A run that keeps failing waits SCAN_WAIT_SECS for the scan, then makes
 # CONNECT_ATTEMPTS attempts of up to two NMCLI_WAIT_SECS nmcli calls each (the

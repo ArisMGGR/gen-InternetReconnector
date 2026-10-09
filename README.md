@@ -97,7 +97,8 @@ Anything you set in the environment rather than type — `RECONNECT_CONFIG`,
 settings — is checked before the first question, against the same rules
 `install-cron.sh` applies, and so are whether `config.env` can actually be read
 and written (and, if it already exists, whether the backup can be written
-beside it) and whether the checkout's own path can be written onto a cron line.
+beside it), whether the checkout's own path can be written onto a cron line,
+and whether `crontab` is installed at all.
 The checkout path is checked first, so a checkout under a directory that
 cannot be installed from is refused as that rather than as a bad config path.
 For the two path settings that means both rules the installer has: the path must

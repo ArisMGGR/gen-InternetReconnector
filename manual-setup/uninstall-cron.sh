@@ -107,11 +107,15 @@ dry_run=0
 assume_yes=0
 show_help=0
 exit_status=0
-# Whether the cron job has already been taken out by the time the log purge asks
-# for confirmation. It has, whenever there was one to take out -- the removal
-# runs first -- and a refusal that does not say so reads as though the whole run
-# had declined to do anything.
-removed_job=0
+# What happened to the cron job by the time the log purge asks for
+# confirmation: "none" (there was nothing to remove), "removed", or "left" (a
+# line survived --remove; the WARNING says which). The removal runs first, and a
+# refusal that does not say what it did reads as though the whole run had
+# declined to do anything. It used to be a yes/no set whenever --remove exited
+# 0 -- which it does when it leaves a hand-edited line alone -- so the refusal
+# said "The cron job was removed" directly under a WARNING that it was still
+# installed.
+job_outcome=none
 while [ "$#" -gt 0 ]; do
     case "$1" in
         --purge-logs) purge_logs=1 ;;
@@ -237,19 +241,44 @@ read_crontab() {
 # version is that it leaves a helper whose own failure still means "empty",
 # which is the shape of the bug rather than the bug.
 #
-# The three rules are the three greps, in order and unchanged: skip a line whose
-# first non-blank character is '#', keep one containing the marker anywhere, keep
-# one containing this checkout's reconnect.sh path anywhere. The path is still
-# matched as a bare substring, which is looser than install-cron.sh's ours() --
-# deliberately; tests/DECISIONS.md D7 records why, and the one case where the
-# looseness shows -- and this rewrite deliberately does not change it.
+# The three rules: skip a line whose first non-blank character is '#', keep one
+# containing the marker anywhere, and keep one that names this checkout's
+# reconnect.sh -- quoted (single or double) or as a whole blank-delimited word.
+# The marker rule is looser than install-cron.sh's ours(), which wants it at the
+# end of the line; tests/DECISIONS.md D7 records why.
+#
+# The path is *not* a bare substring any more, and that looseness was one step
+# too far. A bare substring matched another checkout whose absolute path merely
+# ends in this one's -- /home/u/ir inside /mnt/backup/home/u/ir -- so an
+# uninstall from the shorter checkout reported the other checkout's job as its
+# own, watched --remove correctly leave it, declared it "still installed" and
+# exited 1. With --purge-logs it was worse: the log directory is read off the
+# first line found here, so `--purge-logs --yes` deleted the *other* job's logs.
+# Matching the path as a quoted string or a whole word is exactly the path rule
+# ours() applies (plus the double-quoted spelling a hand-edit might produce), so
+# this still reports every line --remove would delete, which is the direction D7
+# says the looseness must never fail in.
+names_our_script() {
+    local word
+    case "$1" in
+        *"'$RECONNECT'"* | *"\"$RECONNECT\""*) return 0 ;;
+    esac
+    # `read -a` splits on blanks without globbing, unlike an unquoted `for`.
+    local -a words
+    read -r -a words <<< "$1"
+    for word in "${words[@]}"; do
+        [ "$word" != "$RECONNECT" ] || return 0
+    done
+    return 1
+}
+
 our_cron_lines() {
     local line stripped
     while IFS= read -r line; do
         stripped="${line#"${line%%[![:space:]]*}"}"
         case "$stripped" in '#'*) continue ;; esac
         case "$line" in *"$MARKER"*) ;; *) continue ;; esac
-        case "$line" in *"$RECONNECT"*) ;; *) continue ;; esac
+        names_our_script "$line" || continue
         printf '%s\n' "$line"
     done <<< "$1"
 }
@@ -499,7 +528,7 @@ if [ -n "$installed" ]; then
         || die "install-cron.sh not found next to this script (expected at $INSTALLER); it is what removes the cron entry."
     bash "$INSTALLER" --remove \
         || die "install-cron.sh --remove failed; the crontab was left as it was."
-    removed_job=1
+    job_outcome=removed
 
     # Check rather than assume. The installer only deletes lines it is certain
     # are its own, so a line that has been hand-edited past recognition can
@@ -527,6 +556,7 @@ if [ -n "$installed" ]; then
         # to do. Exiting 0 here would tell a script that called us that the
         # uninstall succeeded.
         exit_status=1
+        job_outcome=left
     fi
 fi
 
@@ -547,11 +577,11 @@ if [ "$purge_logs" -eq 1 ]; then
             # consequence argument: a message is only true of the moment it is
             # printed at.
             if [ ! -t 0 ]; then
-                if [ "$removed_job" -eq 1 ]; then
-                    purge_consequence="The cron job was removed; the logs were kept."
-                else
-                    purge_consequence="Nothing was changed."
-                fi
+                case "$job_outcome" in
+                    removed) purge_consequence="The cron job was removed; the logs were kept." ;;
+                    left) purge_consequence="A cron line is still installed (see the WARNING above); the logs were kept." ;;
+                    *) purge_consequence="Nothing was changed." ;;
+                esac
                 die "--purge-logs needs confirmation and there is no terminal to ask at. $purge_consequence Re-run with --yes to delete $(purge_targets) from $LOG_DIR."
             fi
             echo

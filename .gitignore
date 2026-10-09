@@ -26,6 +26,13 @@ config.env
 config.env.bak
 *.env.bak
 
+# Any other copy of a config made by hand (config.env.old, config.env.orig,
+# wifi.env.save, ...) holds the same password and matches none of the patterns
+# above. The negation keeps the shipped template tracked; it must come after
+# the glob it overrides.
+*.env.*
+!*.env.example
+
 # Daily log files produced by reconnect.sh (keep the folder, ignore its logs).
 # The .gitkeep is what actually keeps the folder: git tracks files, not
 # directories, so without it an empty logs/ would not survive a clone. It needs
@@ -58,6 +65,10 @@ Thumbs.db
 .idea/
 .vscode/
 
+# Claude Code per-user settings: local absolute paths and a command allowlist.
+# Ignored here rather than relying on each contributor's global excludes file.
+.claude/settings.local.json
+
 # Working notes from the pre-open-source audit; not project documentation.
 # LOG.md and VERIFY.md are the same kind of thing: a per-session record of what
 # was changed and a per-round record of what was re-checked, useful while the
@@ -66,8 +77,8 @@ Thumbs.db
 # which is ignored just above it.
 #
 # Bare names, matched at any depth for the reason `*.log` and `.lock` above are:
-# FINDINGS.md and VERIFY.md live under tests/, and a `tests/` prefix would stop
-# matching the day a round puts them anywhere else.
+# all three live under tests/, and a `tests/` prefix would stop matching the
+# day a round puts them anywhere else.
 #
 # tests/DECISIONS.md is deliberately NOT here. It is project documentation:
 # README, CONTRIBUTING and the pull-request template all link to it, and

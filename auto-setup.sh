@@ -10,9 +10,11 @@
 #   ./auto-setup.sh          # ask, write config.env, verify, install the cron job
 #   ./auto-setup.sh --help   # show usage
 #
-# It writes exactly two things: config.env (and a config.env.bak beside it, if
-# there was one to preserve) and, through install-cron.sh, the cron line. It
-# never edits the crontab itself -- see the comment above the install step.
+# What it writes: config.env (and a config.env.bak beside it, if there was one
+# to preserve); through the verification run of reconnect.sh, that run's line
+# in today's logs/YYYY-MM-DD.log (and logs/.lock, where flock exists); and,
+# through install-cron.sh, the cron line. It never edits the crontab itself --
+# see the comment above the install step.
 
 set -euo pipefail
 
@@ -43,7 +45,17 @@ EXAMPLE="$MANUAL_DIR/config.env.example"
 # before the installer is called. The suite pins all three copies agreeing.
 MARKER="# InternetReconnector"
 
+# The "Using <SETTING>=... from the installed cron job" notes, held until the
+# script's own header has been printed (see where they are collected). Set
+# here, ahead of die(), because die() prints any still held: a refusal of a
+# value carried off the cron line must still say where that value came from.
+carried_notes=""
+
 die() {
+    if [ -n "$carried_notes" ]; then
+        printf '%s' "$carried_notes" >&2
+        carried_notes=""
+    fi
     echo "ERROR: $*" >&2
     exit 1
 }
@@ -118,9 +130,9 @@ Environment:
 
 All of those are checked before the first question, as is whether config.env can
 actually be read and written (and, when it already exists, whether its backup
-can be written beside it) and whether this checkout's own path can be written
-onto a cron line, so a value that cannot work is refused rather than found out at
-the end of the interview. The checkout path is checked first: when
+can be written beside it), whether this checkout's own path can be written onto
+a cron line, and whether crontab is installed at all, so a run that cannot work
+is refused rather than found out at the end of the interview. The checkout path is checked first: when
 RECONNECT_CONFIG is unset the config lives beside the script, so a checkout
 path that cannot be installed is the reason the config path cannot be either.
 USAGE
@@ -210,6 +222,26 @@ fi
 # bare if a hand-edit unquoted it. That is a third reader of a line two scripts
 # already read, kept to the same two rules the other two use so it cannot
 # acquire a different idea of which line is ours.
+#
+# "Names this checkout's reconnect.sh" means quoted, or as a whole blank-delimited
+# word -- uninstall-cron.sh's names_our_script(), and the path rule of
+# install-cron.sh's ours(). It used to be a bare substring, which also matched
+# another checkout whose absolute path merely ends in this one's (/home/u/ir
+# inside /mnt/backup/home/u/ir): a plain re-run here then took that job's
+# RECONNECT_CONFIG, rewrote *its* config.env with these answers, and exited 0.
+names_our_script() {
+    local word
+    case "$1" in
+        *"'$RECONNECT'"* | *"\"$RECONNECT\""*) return 0 ;;
+    esac
+    local -a words
+    read -r -a words <<< "$1"
+    for word in "${words[@]}"; do
+        [ "$word" != "$RECONNECT" ] || return 0
+    done
+    return 1
+}
+
 installed_line=""
 if command -v crontab >/dev/null 2>&1; then
     installed_crontab="$(LC_ALL=C crontab -l 2>/dev/null || true)"
@@ -217,7 +249,7 @@ if command -v crontab >/dev/null 2>&1; then
         stripped="${cron_line#"${cron_line%%[![:space:]]*}"}"
         case "$stripped" in '#'*) continue ;; esac
         case "$cron_line" in *"$MARKER"*) ;; *) continue ;; esac
-        case "$cron_line" in *"$RECONNECT"*) ;; *) continue ;; esac
+        names_our_script "$cron_line" || continue
         installed_line="$cron_line"
         break
     done <<< "$installed_crontab"
@@ -237,16 +269,20 @@ installed_value() {
     esac
 }
 
-# Said out loud, and before the checks below, so a refusal of a carried value
-# reads as what it is: a value off the installed line, not one the user typed.
-# The names are literals, so the word splitting in the `for` is the point.
+# Said out loud, so a refusal of a carried value reads as what it is: a value
+# off the installed line, not one the user typed. Held rather than printed
+# here, because printing here put these lines above the script's own
+# "InternetReconnector setup" header. They are printed just below that header
+# on a run that gets there, and by die() ahead of the refusal on one that does
+# not. The names are literals, so the word splitting in the `for` is the point.
 for setting in RECONNECT_CONFIG RECONNECT_LOG_DIR RECONNECT_LOG_RETENTION_DAYS \
     RECONNECT_SCAN_WAIT_SECS RECONNECT_CONNECT_ATTEMPTS RECONNECT_NMCLI_WAIT_SECS; do
     [ -z "${!setting:-}" ] || continue
     carried="$(installed_value "$setting" || true)"
     [ -n "$carried" ] || continue
     export "$setting=$carried"
-    echo "Using $setting='$carried' from the installed cron job; set $setting in the environment to override it."
+    carried_notes="${carried_notes}Using $setting='$carried' from the installed cron job; set $setting in the environment to override it.
+"
 done
 
 # Resolved the way reconnect.sh resolves it, so the file this writes is the file
@@ -407,18 +443,29 @@ check_cron_safe() {
 #
 # Checked here rather than left where each is used, for the reason every check
 # in this block sits here: a run that cannot finish should say so before it
-# asks for anything, not after. install-cron.sh:616 refuses a missing
-# reconnect.sh with the same message this uses.
+# asks for anything, not after. install-cron.sh's own `[ -f "$RECONNECT" ]`
+# refuses a missing reconnect.sh too, in its own words: it names the checkout
+# root above manual-setup/, where this names the directory beside this script.
+# Both name the same file.
 [ -f "$RECONNECT" ] \
     || die "reconnect.sh not found next to this script (expected at $RECONNECT); it is what this tests your settings with, and what the cron job runs."
 [ -f "$INSTALLER" ] \
     || die "install-cron.sh not found under manual-setup/ (expected at $INSTALLER); it is what installs the cron entry."
 
+# crontab is the last thing this run needs, which is exactly why it has to be
+# checked first. It was not checked at all: on a machine without cron the
+# interview ran, the Wi-Fi password was read, config.env was written and the
+# verification passed ("Settings work") before install-cron.sh refused with
+# "crontab not found" at the very end -- the one gap left in a block whose rule
+# is that a run which cannot finish says so before it asks for anything.
+command -v crontab >/dev/null 2>&1 \
+    || die "crontab not found. Install cron (e.g. 'sudo apt install cron'); it is what schedules the job. Nothing was asked for, so nothing is lost -- install it and run this again."
+
 # The install path is one of the four values install-cron.sh vets with the
 # crontab-safety rule. It is not a setting -- it is where this checkout happens
 # to sit -- and install-cron.sh vets it in exactly this position too,
-# immediately after its own `[ -f "$RECONNECT" ]` (install-cron.sh:616, then
-# :623-627).
+# immediately after its own `[ -f "$RECONNECT" ]`, with the `case` that refuses
+# a single quote, a '%' or a line break in the install path.
 #
 # It is vetted *first*, ahead of the config path below, and the order is the
 # point. $CONFIG_FILE defaults to $SCRIPT_DIR/config.env, so a checkout under a
@@ -654,9 +701,21 @@ Run this from a terminal, or write $CONFIG_FILE by hand from $EXAMPLE and then r
 # means `5 ` is accepted as 5 rather than refused as "not a whole number", which
 # is a needless re-prompt over something with exactly one sensible reading. It is
 # deliberately not used for the SSID or the password, where a blank can be real.
+#
+# The `|| exit 1` is what carries ask()'s end-of-input refusal out of here, and
+# it is not redundant with `set -e`. This function always runs inside a command
+# substitution, and bash clears `set -e` in those, so the failed assignment
+# below used to be ignored: ask()'s die() ended only the inner subshell, this
+# function went on to print an empty reply and return 0, and every caller read
+# that as "take the default". Measured: with the answers running out after the
+# password, the run printed "no more input" three times and then wrote
+# config.env, installed the cron job and exited 0 -- end of input taken as
+# consent, the one thing ask() exists to prevent. die()'s message has already
+# been printed by then, so a bare exit is enough, and the caller's assignment
+# fails under its own `set -e`.
 ask_trimmed() {
     local reply
-    reply="$(ask "$1")"
+    reply="$(ask "$1")" || exit 1
     reply="${reply#"${reply%%[![:space:]]*}"}"
     reply="${reply%"${reply##*[![:space:]]}"}"
     printf '%s' "$reply"
@@ -738,6 +797,10 @@ fi
 
 echo "InternetReconnector setup"
 echo
+if [ -n "$carried_notes" ]; then
+    printf '%s\n' "$carried_notes"
+    carried_notes=""
+fi
 if [ "$had_config" -eq 1 ]; then
     echo "There is already a config at $CONFIG_FILE."
     echo "Its current settings are the defaults below -- press Enter to keep one."
@@ -960,9 +1023,37 @@ if [ -n "${MINUTES:-}" ]; then
     echo "Using the interval from MINUTES: every $minutes minutes."
 else
     echo
-    if [ "$had_config" -eq 1 ]; then
+    # What Enter means depends on whether a job is installed, not on whether a
+    # config exists -- install-cron.sh reads the interval off the cron line, and
+    # the line can exist without a config. This used to test $had_config, so
+    # after the manual route in the "wrong" order (install first, which
+    # install-cron.sh itself anticipates with its "no config file yet" note), a
+    # first run here said "Press Enter for every 5 minutes" and then installed
+    # the 10 the line already carried. The interval is read off the line the
+    # way install-cron.sh's previous_minutes() reads it, so the prompt can name
+    # it; a line whose schedule is not `*/N` falls back to the general wording.
+    installed_minutes=""
+    if [ -n "$installed_line" ]; then
+        installed_minutes="${installed_line#"${installed_line%%[![:space:]]*}"}"
+        case "$installed_minutes" in
+            '*/'*)
+                installed_minutes="${installed_minutes%%[[:space:]]*}"
+                installed_minutes="${installed_minutes#\*/}"
+                # One or two digits only: every legal interval fits, and a
+                # hand-edited wider value is never fed to `$(( ))`, which wraps.
+                case "$installed_minutes" in
+                    [0-9] | [0-9][0-9]) installed_minutes="$((10#$installed_minutes))" ;;
+                    *) installed_minutes="" ;;
+                esac
+                ;;
+            *) installed_minutes="" ;;
+        esac
+    fi
+    if [ -n "$installed_minutes" ]; then
         echo "Run how often? Press Enter to keep the interval already installed"
-        echo "(or 5 minutes if there is no job installed yet)."
+        echo "(every $installed_minutes minutes)."
+    elif [ -n "$installed_line" ]; then
+        echo "Run how often? Press Enter to keep the interval already installed."
     else
         echo "Run how often? Press Enter for every 5 minutes."
     fi
@@ -1123,18 +1214,30 @@ printf '  WIFI_HIDDEN   %s\n' "$hidden"
 # that reached this point had it, and the lines are counted with `read`
 # rather than `wc` or `tail`, which this script does not otherwise need.
 VERIFY_LOG_DIR="${RECONNECT_LOG_DIR:-$SCRIPT_DIR/logs}"
-# Non-empty lines in $1; 0 when it does not exist.
+#
+# A day file that exists but cannot be opened for reading -- another owner at
+# mode 600, left by an earlier `sudo ./reconnect.sh` -- is read as "no line",
+# which the readback below reports as a run it could not confirm. Both reads
+# used to be bare, so the failed redirect printed bash's own `line NNN: ...:
+# Permission denied` and, inside the `verify_line=` assignment, ended the run
+# under `set -e` with exit 1 and no stated reason, after config.env had
+# already been written. `2>/dev/null` comes before the `<` for the reason the
+# config write further up orders its own redirections that way: left to right,
+# the other order reports the failed open before stderr is silenced.
+#
+# Non-empty lines in $1; 0 when it does not exist or cannot be read.
 log_line_count() {
     local line n=0
     if [ -f "$1" ]; then
         while IFS= read -r line || [ -n "$line" ]; do
             [ -z "$line" ] || n=$((n + 1))
-        done < "$1"
+        done 2>/dev/null < "$1" || n=0
     fi
     printf '%s' "$n"
 }
 # The outcome on the first non-empty line of $1 past the first $2 of them, with
-# the [HH:MM:SS] prefix stripped; empty when no such line exists.
+# the [HH:MM:SS] prefix stripped; empty when no such line exists or the file
+# cannot be read.
 log_line_after() {
     local line n=0
     [ -f "$1" ] || return 0
@@ -1145,7 +1248,8 @@ log_line_after() {
             printf '%s' "${line#\[*\] }"
             return 0
         fi
-    done < "$1"
+    done 2>/dev/null < "$1" || true
+    return 0
 }
 echo
 echo "Testing the settings by running reconnect.sh once..."
@@ -1180,11 +1284,12 @@ if [ "$verify_status" -eq 0 ]; then
         "Wifi Good" | "Wifi Reconnected") ;;
         *)
             echo >&2
-            echo "reconnect.sh exited 0 but wrote no new line to $VERIFY_LOG_DIR, so" >&2
-            echo "the settings could not be confirmed and the cron job was NOT installed." >&2
-            echo "A job that cannot write its log line would fail in silence. Read the" >&2
-            echo "warning above (usually the log directory cannot be created, or today's" >&2
-            echo "log file cannot be written to), fix it, and re-run this script;" >&2
+            echo "reconnect.sh exited 0 but wrote no new line that could be read back from" >&2
+            echo "$VERIFY_LOG_DIR, so the settings could not be confirmed and the cron job" >&2
+            echo "was NOT installed. A job that cannot write its log line would fail in" >&2
+            echo "silence. Read the warning above (usually the log directory cannot be" >&2
+            echo "created, or today's log file cannot be written to or read -- check its" >&2
+            echo "owner and mode), fix it, and re-run this script;" >&2
             echo "$CONFIG_FILE has been kept." >&2
             exit 1
             ;;

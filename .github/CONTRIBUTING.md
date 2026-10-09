@@ -194,7 +194,9 @@ are pure text processing:
   value — including the interval, which it leaves to `install-cron.sh` rather
   than defaulting to 5 and undoing the carry-over. Also that blanks inside an
   SSID or a password survive (`read` strips them without `IFS=`), that a
-  password never reaches the terminal, that settings `reconnect.sh` rejects stop
+  password is never printed in the output (and, since a pipe cannot observe
+  terminal echo, that the prompt is read with `-s`, pinned on the source rather
+  than on behaviour), that settings `reconnect.sh` rejects stop
   the run before the crontab is touched, and that running out of input is a
   stated failure rather than consent. `read -p` shows its prompt only on a
   terminal, so nothing there asserts on prompt text — the observables are the
@@ -355,6 +357,16 @@ are pure text processing:
   re-installed a job still reading the other file. Pinned on the config path,
   the log directory and a tuning value, with the environment still winning as
   the control, and the third copy of the marker constant held to the other two
+- the round-1 audit backlog: a mistyped password line containing `=` is
+  reported without echoing the password; a `.lock` path that cannot be opened
+  skips the lock instead of ending the run with no log line; a line of ours
+  edited after the marker is reported on install and on `--remove`; another
+  checkout whose path ends in this one's is neither adopted by `auto-setup.sh`
+  nor purged by `uninstall-cron.sh`; the no-terminal purge refusal says a line
+  is still installed when one is; and `auto-setup.sh` refuses a machine with no
+  `crontab` before the interview, prints the carry-over notes under its header,
+  names the installed interval at the interval prompt, and reports an unreadable
+  day file in its own words
 
 Anything that actually talks to `nmcli` is **not** covered and still has to be
 verified by hand against a real NetworkManager. If you change connect

@@ -137,8 +137,17 @@ release and later only, which means a version check.
 **What a review sees:** `install-cron.sh`'s `ours()` claims a line only when it
 is not a comment, ends with the marker, and names this checkout's
 `reconnect.sh` as a shell word; `uninstall-cron.sh`'s `our_cron_lines()` skips
-comments and then accepts the marker and the path as bare substrings anywhere.
-The two can disagree about a hand-edited line.
+comments and then accepts the marker anywhere on the line, with the path quoted
+or as a whole word. The two can disagree about a hand-edited line.
+
+The path used to be a bare substring too, and that was looser than this
+decision needs: it also matched another checkout whose absolute path merely
+ends in this one's (`/home/u/ir` inside `/mnt/backup/home/u/ir`), so the
+uninstaller reported that job as its own and `--purge-logs` read the other
+job's log directory off it and deleted its logs. The path rule is now exactly
+the one `install-cron.sh` applies (plus the double-quoted spelling), which
+keeps every line `--remove` would delete in the report. `auto-setup.sh` reads
+settings back off the line with the same rule.
 
 **Decision:** keep the two rules different, with the strict one deciding what
 is deleted and the loose one deciding what is reported.
