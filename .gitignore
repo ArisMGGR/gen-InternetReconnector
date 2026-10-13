@@ -1,59 +1,18 @@
-# Real config holds your Wi-Fi password — never commit it.
-#
-# The glob covers a copy kept under a different name (.env, wifi.env, home.env)
-# as well as the documented one. config.env.example is unaffected: its name
-# ends in .example, not .env.
+# Real config holds the Wi-Fi password -- never commit it, under any name.
 config.env
 *.env
 
-# The backup auto-setup.sh writes before it overwrites the config. It is a copy
-# of the file above and holds the same password, and it is matched by neither
-# pattern: not `config.env`, which is exact, and not `*.env`, because the name
-# ends in `.bak`.
-#
-# Both spellings, and the glob is the one that matters. auto-setup.sh writes
-# "$CONFIG_FILE.bak" for whatever RECONNECT_CONFIG names, so a config kept under
-# a different name -- exactly the case `*.env` above exists for -- had its
-# backup left untracked but not ignored, holding the Wi-Fi password in
-# plaintext, with nothing on screen to say so: the run reports "Saved the
-# previous config as ...bak" and exits 0. `wifi.env` was ignored and
-# `wifi.env.bak` was not.
-#
-# Deliberately `*.env.bak` rather than `*.bak`: this matches only the backup of
-# a config, and a stray editor backup of some other file stays something this
-# project has no opinion about. The exact name is kept beside it because it is
-# the one the documentation names.
+# Backups auto-setup.sh writes ("$CONFIG_FILE.bak") and hand-made copies
+# (.old, .orig, .save, ...). Same password inside. The negation keeps the
+# shipped template tracked and must come after the glob it overrides.
 config.env.bak
 *.env.bak
-
-# Any other copy of a config made by hand (config.env.old, config.env.orig,
-# wifi.env.save, ...) holds the same password and matches none of the patterns
-# above. The negation keeps the shipped template tracked; it must come after
-# the glob it overrides.
 *.env.*
 !*.env.example
 
-# Daily log files produced by reconnect.sh (keep the folder, ignore its logs).
-# The .gitkeep is what actually keeps the folder: git tracks files, not
-# directories, so without it an empty logs/ would not survive a clone. It needs
-# no `!` rule of its own -- nothing in this file matches it. There used to be
-# one, which read as though the file were being rescued from an ignore rule and
-# invited a later edit to broaden the rule above on the assumption that the
-# negation had it covered.
-#
-# Matched by name rather than by path. RECONNECT_LOG_DIR can send the logs
-# anywhere -- install-cron.sh insists on an absolute path, but an absolute path
-# may still be inside the checkout, and a hand-run is not restricted at all --
-# and `logs/*.log` covered exactly one directory of the several they can land
-# in. Nothing in this project tracks a .log file, so the bare pattern costs
-# nothing.
+# Daily logs and the run lock. Matched by name because RECONNECT_LOG_DIR can
+# put them anywhere. logs/.gitkeep keeps the folder and matches neither rule.
 *.log
-
-# Lock file reconnect.sh uses to keep two runs from overlapping. Matched by name
-# for exactly the reason the daily logs above are: reconnect.sh writes it into
-# RECONNECT_LOG_DIR, so it lands wherever they land, and `logs/.lock` covered one
-# of the several directories it can land in. Nothing here tracks a file called
-# .lock, so the bare pattern costs nothing.
 .lock
 
 # OS and editor cruft
@@ -65,24 +24,12 @@ Thumbs.db
 .idea/
 .vscode/
 
-# Claude Code per-user settings: local absolute paths and a command allowlist.
-# Ignored here rather than relying on each contributor's global excludes file.
+# Claude Code per-user files: local absolute paths, allowlists, personal notes.
 .claude/settings.local.json
+CLAUDE.local.md
 
 # Working notes from the pre-open-source audit; not project documentation.
-# LOG.md and VERIFY.md are the same kind of thing: a per-session record of what
-# was changed and a per-round record of what was re-checked, useful while the
-# tree is being worked on and meaningless to anyone reading the published
-# repository -- VERIFY.md cites F-numbers that resolve only against FINDINGS.md,
-# which is ignored just above it.
-#
-# Bare names, matched at any depth for the reason `*.log` and `.lock` above are:
-# all three live under tests/, and a `tests/` prefix would stop matching the
-# day a round puts them anywhere else.
-#
-# tests/DECISIONS.md is deliberately NOT here. It is project documentation:
-# README, CONTRIBUTING and the pull-request template all link to it, and
-# reconnect.sh, uninstall-cron.sh and the suite cite its entries by number.
+# tests/DECISIONS.md is deliberately NOT here -- docs and scripts cite it.
 FINDINGS.md
 LOG.md
 VERIFY.md
