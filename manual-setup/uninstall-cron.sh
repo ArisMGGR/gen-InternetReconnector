@@ -23,6 +23,10 @@
 
 set -euo pipefail
 
+# For the reason written out in reconnect.sh: an exported CDPATH makes the `cd`
+# below print into the substitution that resolves this script's directory.
+unset CDPATH
+
 # Split with parameter expansion rather than `dirname`, for the reason written
 # out in full in reconnect.sh and shared by all four scripts. `*/*` fails for a
 # bare name (`bash uninstall-cron.sh`), which means the current directory; the
@@ -35,16 +39,30 @@ case "$script_src" in
         ;;
     *) script_dir=. ;;
 esac
-SCRIPT_DIR="$(cd "$script_dir" && pwd)"
+# `pwd -P` for the reason install-cron.sh gives where it resolves the same path:
+# the physical path is the one the cron line is written with, whichever symlink
+# the checkout was reached through.
+SCRIPT_DIR="$(cd "$script_dir" && pwd -P)"
 # This script lives in manual-setup/, one level below the checkout root, beside
 # install-cron.sh. reconnect.sh and the default logs/ live at the root, which is
 # what the cron line names and what reconnect.sh resolves its own defaults
 # against -- so the root is resolved once here and used for both. Resolving them
 # against this directory instead would make the report look for a job that
 # runs a reconnect.sh that does not exist and purge a logs/ nothing writes to.
-ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
-INSTALLER="$SCRIPT_DIR/install-cron.sh"
+ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd -P)"
+# Called by the spelling this run arrived by, not by the physical path.
+# install-cron.sh takes its RECONNECT_ALIAS from the path it is started through,
+# so starting it by $SCRIPT_DIR left it with no alias at all: a line written
+# through a symlink was reported here as ours, `--remove` then called it
+# "a different copy" and left it, and the uninstall ended in the "still
+# installed" WARNING and exit 1 over the checkout's own job. Through a plain
+# directory the two spellings are the same.
+INSTALLER="$(cd "$script_dir" && pwd)/install-cron.sh"
 RECONNECT="$ROOT_DIR/reconnect.sh"
+# The spelling this run reached the checkout by, which a line written through a
+# symlink by an earlier version names. install-cron.sh's ours() accepts it too,
+# so this keeps reporting every line --remove would delete (D7's direction).
+RECONNECT_ALIAS="$(cd "$script_dir/.." && pwd)/reconnect.sh"
 MARKER="# InternetReconnector"
 
 # Provisional. Refined once the crontab has been read, from the value
@@ -84,7 +102,8 @@ Usage: uninstall-cron.sh [--purge-logs] [--dry-run] [--yes] [--help]
 
 Your config.env is never touched: it holds the SSID and password, it is not
 something this script created, and re-installing later is much easier with it
-still in place. Delete it yourself if you want it gone.
+still in place. Delete it yourself if you want it gone -- and config.env.bak
+beside it too, if auto-setup.sh left one, since that holds the password as well.
 
 Environment:
   RECONNECT_LOG_DIR   Log directory to purge. Defaults to the directory named
@@ -159,7 +178,18 @@ fi
 read_crontab() {
     local consequence="${1:-Nothing was changed.}"
     local out rc=0 err
-    err="$(mktemp)"
+    # Checked, not left to `set -e`. This function always runs inside a command
+    # substitution, and bash clears `set -e` there -- auto-setup.sh's
+    # ask_trimmed() records the same trap -- so a failed mktemp left $err
+    # empty and the run carried on. The `2>""` below then failed as a
+    # redirect, which made `crontab -l` "exit 1 with no output and nothing on
+    # stderr" -- exactly the shape the test further down accepts as "no crontab
+    # yet". Measured with TMPDIR pointing at a directory that does not exist:
+    # "No cron job found", "Verify with: crontab -l" and exit 0, over a job
+    # still installed and still running. That is the read failure this
+    # function's own header says must never be treated as an empty crontab.
+    err="$(mktemp)" \
+        || die "could not create a temporary file (mktemp failed -- check TMPDIR), which is what tells \"there is no crontab yet\" from a crontab that could not be read. $consequence"
     out="$(LC_ALL=C crontab -l 2>"$err")" || rc=$?
     if [ "$rc" -ne 0 ]; then
         # The one `grep` this script runs, checked on the one branch that
@@ -188,8 +218,11 @@ read_crontab() {
                 die "grep not found. Install it (e.g. 'sudo apt install grep'). It is what tells \"there is no crontab yet\" from a crontab that could not be read, and guessing between those two is not safe. $consequence"
             }
         fi
+        # The second alternative is BusyBox's "no crontab yet", the shape
+        # install-cron.sh's mentions_no_crontab() explains and accepts.
         if [ "$rc" -ne 1 ] || [ -n "$out" ] \
-            || { [ -s "$err" ] && ! grep -qi 'no crontab' "$err"; }; then
+            || { [ -s "$err" ] \
+                && ! grep -qiE "no crontab|can't open '.*': No such file or directory" "$err"; }; then
             # `cat` is checked in usage(), the only other place it is used, and
             # so is not guaranteed here. Passing crontab's diagnostic on is
             # worth having and not worth refusing every ordinary uninstall for:
@@ -259,15 +292,18 @@ read_crontab() {
 # this still reports every line --remove would delete, which is the direction D7
 # says the looseness must never fail in.
 names_our_script() {
-    local word
-    case "$1" in
-        *"'$RECONNECT'"* | *"\"$RECONNECT\""*) return 0 ;;
-    esac
+    local word path
+    for path in "$RECONNECT" "$RECONNECT_ALIAS"; do
+        case "$1" in
+            *"'$path'"* | *"\"$path\""*) return 0 ;;
+        esac
+    done
     # `read -a` splits on blanks without globbing, unlike an unquoted `for`.
     local -a words
     read -r -a words <<< "$1"
     for word in "${words[@]}"; do
         [ "$word" != "$RECONNECT" ] || return 0
+        [ "$word" != "$RECONNECT_ALIAS" ] || return 0
     done
     return 1
 }
@@ -503,8 +539,35 @@ if [ "$dry_run" -eq 1 ]; then
     # only the logs left the caller to infer the main action from the "Found
     # the cron job" line printed further up, which is the one thing a dry run
     # exists to spell out.
+    #
+    # What would be removed is asked of install-cron.sh, which does the removing.
+    # $installed is this script's loose report (D7) and can hold a line --remove
+    # will leave -- one edited after the marker, say -- and answering off it
+    # promised "Would remove the cron job" over a line the real run then left in
+    # place, ending in the "still installed" WARNING and exit 1. Lines reported
+    # here that install-cron.sh will not take are named as what they are.
     if [ -n "$installed" ]; then
-        echo "Would remove the cron job for $RECONNECT."
+        [ -f "$INSTALLER" ] \
+            || die "install-cron.sh not found next to this script (expected at $INSTALLER); it is what removes the cron entry, and what says which lines it would remove."
+        would_remove="$(bash "$INSTALLER" --remove-dry-run)" \
+            || die "install-cron.sh --remove-dry-run failed. Nothing was changed."
+        [ -z "$would_remove" ] || echo "Would remove the cron job for $RECONNECT."
+        would_leave=""
+        while IFS= read -r cron_line; do
+            case $'\n'"$would_remove"$'\n' in
+                *$'\n'"$cron_line"$'\n'*) ;;
+                *) would_leave="$would_leave$cron_line"$'\n' ;;
+            esac
+        done <<< "$installed"
+        if [ -n "$would_leave" ]; then
+            echo "Would leave this line in place: it runs this checkout's reconnect.sh,"
+            echo "but install-cron.sh does not recognise it as its own, so the real run"
+            echo "would report it as still installed and exit 1. Remove it by hand with"
+            echo "'crontab -e':"
+            while IFS= read -r cron_line; do
+                [ -z "$cron_line" ] || printf '  %s\n' "$cron_line"
+            done <<< "$would_leave"
+        fi
     else
         echo "No cron job to remove."
     fi
@@ -589,13 +652,20 @@ if [ "$purge_logs" -eq 1 ]; then
             [ "${#log_files[@]}" -eq 0 ] || printf '  %s\n' "${log_files[@]}"
             [ -z "$lock_file" ] || printf '  %s (lock file)\n' "$lock_file"
             printf 'Delete them? [y/N] '
-            # `|| reply=""` rather than a bare read. Under `set -e` a read that
+            # `|| true` rather than a bare read. Under `set -e` a read that
             # hits EOF -- Ctrl-D at the prompt -- exited 1 straight out of the
             # script: no "Kept the logs.", no message of any kind, and the
             # exit_status accumulated above thrown away, so a deliberate cancel
             # was indistinguishable from a crash. An empty answer falls through
             # to the `*)` arm below, which is already the "keep them" case.
-            read -r reply || reply=""
+            #
+            # And not `|| reply=""`, which is what stood here: an answer typed
+            # without a newline before Ctrl-D is still an answer -- `read`
+            # returns 1 but assigns it -- and clearing it turned a typed "y"
+            # into "Kept the logs.". auto-setup.sh's ask() takes an
+            # unterminated answer the same way.
+            reply=""
+            read -r reply || true
             case "$reply" in
                 [yY] | [yY][eE][sS]) ;;
                 *) echo "Kept the logs."; exit "$exit_status" ;;

@@ -320,14 +320,15 @@ are pure text processing:
   right answer and is pinned separately — `read_crontab()` still needs grep to
   tell "no crontab yet" from a failed read, so it refuses rather than guessing
 - which `nmcli` calls a connect actually makes, including when the password form
-  is reached — the property `SECURITY.md` documents — and that the two bare
-  positionals (the profile name in the lookup, the SSID in the password form)
-  are passed with nothing in front of them. They carried a `--` for a while,
-  meant as an end-of-options marker; `nmcli` has none in either position, so the
-  `--` *was* the name, every real profile lookup and password connect failed,
+  is reached — the property `SECURITY.md` documents — and how the names reach
+  `nmcli`. The SSID in the password form is passed with nothing in front of it:
+  it carried a `--` for a while, meant as an end-of-options marker; `nmcli` has
+  none there, so the `--` *was* the SSID, every real password connect failed,
   and the suite stayed green because its stub stripped the `--` itself
   ([DECISIONS.md](../tests/DECISIONS.md) D6). Pinned on an SSID beginning with
-  `-`, the one input a `--` would be put back for
+  `-`, the one input a `--` would be put back for. The profile lookup goes
+  through `connection show id NAME`, so a profile named `--active` or `id` is
+  found and brought up; the stub answers only that spelling
 - that a day file `reconnect.sh` cannot append to produces its own `WARNING`
   and not bash's `Permission denied` ahead of it — the printf's redirections
   were ordered so that stderr was silenced only after the open had already
@@ -337,11 +338,12 @@ are pure text processing:
   overlap lock is held, so a re-run while the scheduled job was mid-run installed
   untested settings under "Settings work". Pinned with the lock held and a wrong
   password, with the lock-free run as the control; self-skips without `flock`.
-  And that the line it judges by is *this run's*: the day file's lines are
-  counted before the run and only a line past that count is taken, because
-  "the last line" let a stale one in an unwritable file stand in for the
-  outcome. Pinned with a stale `Wifi Good` in a file made unwritable (refused
-  as having written nothing; self-skips where modes are not enforced) and, as
+  And that the outcome it judges by is *this run's*, reported through
+  `IR_OUTCOME_FILE` rather than read off the day file, because "the last
+  line" let a stale one in an unwritable file stand in for the
+  outcome. Pinned with a stale `Wifi Good` in a file made unwritable during the
+  run (refused as having written nothing; self-skips where modes are not
+  enforced) and, as
   the control, a stale `FAIL` in a writable one that must be passed over
 - that a `RECONNECT_LOG_DIR` which can never be created is refused before the
   interview: `reconnect.sh` treats one it cannot create as a warning rather than
@@ -357,8 +359,8 @@ are pure text processing:
   re-installed a job still reading the other file. Pinned on the config path,
   the log directory and a tuning value, with the environment still winning as
   the control, and the third copy of the marker constant held to the other two
-- the round-1 audit backlog: a mistyped password line containing `=` is
-  reported without echoing the password; a `.lock` path that cannot be opened
+- a mistyped password line containing `=` is reported without echoing the
+  password; a `.lock` path that cannot be opened
   skips the lock instead of ending the run with no log line; a line of ours
   edited after the marker is reported on install and on `--remove`; another
   checkout whose path ends in this one's is neither adopted by `auto-setup.sh`
@@ -367,6 +369,82 @@ are pure text processing:
   `crontab` before the interview, prints the carry-over notes under its header,
   names the installed interval at the interval prompt, and reports an unreadable
   day file in its own words
+- a password typed straight after its setting name, with no separator, is not
+  echoed either; the ignore-rule matcher honours `!` the way git does, so the
+  `*.env.*` / `!*.env.example` pair is read correctly; `uninstall-cron.sh`
+  refuses rather than reading the crontab as empty when it cannot create its
+  temporary file; `auto-setup.sh` says when the verification run never tried
+  the password it was just given; and the interval-prompt assertion is pinned
+  on the prompt's own wording, not on text the installer also prints
+- a `CRON_PATH` that reaches `nmcli` but not `bash` is warned about at install
+  time, because the job could then never start; `auto-setup.sh` refuses a
+  crontab that exists but cannot be read (cron.allow, cron.deny) before the
+  interview rather than after it; and a checkout reached through a symlink is
+  the same checkout to every script that reads the cron line, including a line
+  an earlier version wrote through the symlink. The symlink case self-skips
+  where `ln -s` does not make a real link
+- the three crontab readers agreeing about a failed `crontab -l` whose stderr is
+  a lone newline (refused by all three), and about BusyBox's
+  "can't open '<user>': No such file or directory" (read as "no crontab yet",
+  while the same message with another reason is still refused — matched on
+  BusyBox's source, not run against a real BusyBox cron); `auto-setup.sh`
+  refusing a machine without `mktemp`, `awk`, `rm` or `date` before the
+  interview, and reporting an installed interval `install-cron.sh` would refuse
+  rather than offering to keep it; and an exported `CDPATH` not breaking a script
+  run by a bare relative path such as `bash manual-setup/install-cron.sh`
+- `install-cron.sh` noting a `RECONNECT_CONFIG` that exists but is not a regular
+  file or cannot be read, and not only one that is missing, since `reconnect.sh`
+  refuses all three. The unreadable case self-skips where modes are not enforced
+- `auto-setup.sh` judging its verification by the outcome that run itself
+  reported (through `IR_OUTCOME_FILE`), so a line the scheduled job appends to
+  the same day file meanwhile cannot stand in for it, in either direction; a
+  target that is the second of two active Wi-Fi connections still counting as
+  connected, with a pinned `WIFI_IFACE` still ignoring the other device; and
+  `auto-setup.sh` refusing a re-run without `cp` before the interview
+- `auto-setup.sh` putting the previous `config.env` back (or removing a new
+  one) when its verification is refused while a job is installed, so that job
+  keeps the settings it had, after a failed run and after a skipped one; a last
+  answer with no newline after it being an answer rather than end of input; the
+  interval prompt reporting a schedule that is not `*/N`, and a line edited
+  after the marker, as intervals that cannot be kept; and
+  `uninstall-cron.sh --dry-run` asking `install-cron.sh --remove-dry-run` what
+  would be removed, so a line `--remove` will leave is reported as left
+- a line of this checkout's with the path put in double quotes being reported
+  by `install-cron.sh` as edited by hand, not as another checkout's line to be
+  removed "from that copy"
+- the suite clearing every setting the scripts read from the environment before
+  it runs anything. It used to inherit them, so with `RECONNECT_CONFIG` and
+  `RECONNECT_LOG_DIR` exported in your shell the cases that test the defaults
+  wrote over your real config and purged your real logs. Its own knobs
+  (`SCAN_WAIT`, `ATTEMPTS`, `NMCLI_WAIT`, `RETENTION`, `RACE_*`) are cleared
+  with them, and the argument probe exits 3 rather than 0, so an exported
+  `IR_ARGV_PROBE` cannot turn a run that tested nothing into a green one
+- `auto-setup.sh` refusing, before the interview, a log directory it cannot
+  write — the default `logs/` as well as a `RECONNECT_LOG_DIR` — and a day log
+  it cannot append to, such as one an earlier `sudo ./reconnect.sh` left. Those
+  used to surface only after every question and the password. The readback
+  that catches what the check cannot foresee is pinned separately, with the
+  day file made unwritable during the run
+- `install-cron.sh` leaving the checkout's modes alone on an install it then
+  refuses over a bad setting; the executable bits are set only once every value
+  has been vetted. Self-skips where the filesystem does not drop the bit
+- `auto-setup.sh` refusing when `install-cron.sh` fails after the test passed:
+  it says whether the job already installed was left in place rather than
+  claiming none is installed, and the `install-cron.sh` command it suggests
+  carries the interval chosen at the prompt and any `RECONNECT_*` or
+  `CRON_PATH` setting of this run. The assertions run that command as printed
+  and check what it installs, with all seven of those settings set at once
+- `auto-setup.sh` taking `-` on a re-run to clear a stored password or interface,
+  since Enter keeps them; the typed-name and numbered-list interface prompts are
+  both covered
+- `install-cron.sh` noting a log directory the job could never create or write
+  (and an unwritable day file), as it notes an unusable config. The unwritable
+  cases self-skip where modes are not enforced
+- a `flock` that is present but cannot lock — any exit status but 1, such as
+  the 71 util-linux gives on a filesystem without lock support — treated like a
+  missing `flock` rather than as another run holding the lock, so neither the
+  job nor `auto-setup.sh`'s verification steps aside forever; a stub `flock`
+  exiting 1 is the control that the conflict still skips
 
 Anything that actually talks to `nmcli` is **not** covered and still has to be
 verified by hand against a real NetworkManager. If you change connect
@@ -398,9 +476,15 @@ any individual preference here:
   reason the scripts are maintainable.
 - Every exit path in `reconnect.sh` writes exactly one log line. If you add a
   new one, it goes through `status()` or `die()`.
-- Never put the Wi-Fi password on a command line, in a log file, or in an error
-  message. `remember_error()` scrubs it out of nmcli's output; parse errors
-  print the line number and key, never the line.
+- Never put the Wi-Fi password in a log file or an error message, and never on a
+  command line beyond the one place that already does: `connect_with_password()`
+  in `reconnect.sh` hands it to `nmcli dev wifi connect` as an argument,
+  because before a NetworkManager profile exists there is no other way to
+  connect. [SECURITY.md](SECURITY.md) documents when that path runs (the first
+  connect, and any attempt whose saved profile fails to come up). Do not add a
+  second such path, and do not remove that one without something else that can
+  make the first connect. `remember_error()` scrubs the password out of nmcli's
+  output; parse errors print the line number and key, never the line.
 - Prefer a stated failure over a silent one. Under cron, stderr goes to
   `/dev/null`, so anything not logged is invisible.
 - `config.env` is parsed, never sourced. Do not "simplify" that.

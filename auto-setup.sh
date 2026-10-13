@@ -11,12 +11,18 @@
 #   ./auto-setup.sh --help   # show usage
 #
 # What it writes: config.env (and a config.env.bak beside it, if there was one
-# to preserve); through the verification run of reconnect.sh, that run's line
-# in today's logs/YYYY-MM-DD.log (and logs/.lock, where flock exists); and,
+# to preserve -- copied back over config.env when the test fails while a job is
+# installed); through the verification run of reconnect.sh, that run's line
+# in today's logs/YYYY-MM-DD.log (and logs/.lock, where flock exists); a
+# temporary file that run reports its outcome into, removed on exit; and,
 # through install-cron.sh, the cron line. It never edits the crontab itself --
 # see the comment above the install step.
 
 set -euo pipefail
+
+# For the reason written out in reconnect.sh: an exported CDPATH makes the `cd`
+# below print into the substitution that resolves this script's directory.
+unset CDPATH
 
 # Split with parameter expansion rather than `dirname`, for the reason written
 # out in full in reconnect.sh and shared by all four scripts. `*/*` fails for a
@@ -30,14 +36,25 @@ case "$script_src" in
         ;;
     *) script_dir=. ;;
 esac
-SCRIPT_DIR="$(cd "$script_dir" && pwd)"
+# `pwd -P` for the reason install-cron.sh gives where it resolves the same path:
+# the cron line is written with the physical path, whichever symlink the
+# checkout was reached through, so this has to look for that spelling.
+SCRIPT_DIR="$(cd "$script_dir" && pwd -P)"
 RECONNECT="$SCRIPT_DIR/reconnect.sh"
+# The spelling this run reached the checkout by, which a line an earlier version
+# wrote through a symlink names; install-cron.sh's ours() accepts it too.
+RECONNECT_ALIAS="$(cd "$script_dir" && pwd)/reconnect.sh"
 # The two cron scripts and the example config live under manual-setup/, one
 # level below this script; reconnect.sh, config.env and logs/ stay at the root
 # beside it, because reconnect.sh resolves its own defaults against its own
 # directory and the cron line names it there.
 MANUAL_DIR="$SCRIPT_DIR/manual-setup"
-INSTALLER="$MANUAL_DIR/install-cron.sh"
+# Started by the spelling this run arrived by, for the reason uninstall-cron.sh
+# gives beside its own INSTALLER: install-cron.sh takes its alias from the path
+# it is started through, so started by the physical path it called a line
+# written through a symlink "a different copy" and installed a second job
+# beside it -- after this script had read that same line as its own.
+INSTALLER="${RECONNECT_ALIAS%/reconnect.sh}/manual-setup/install-cron.sh"
 EXAMPLE="$MANUAL_DIR/config.env.example"
 
 # The tag install-cron.sh puts at the end of the line it writes. Defined here
@@ -89,16 +106,20 @@ You are asked for:
   WIFI_PASSWORD    Optional. Leave it empty if NetworkManager already has a
                    saved profile for the network -- connect once through the
                    desktop UI and the password never has to be stored here at
-                   all. See .github/SECURITY.md.
+                   all. See .github/SECURITY.md. On a re-run Enter keeps the
+                   stored one and '-' removes it.
   WIFI_IFACE       Optional. Which Wi-Fi device to pin, chosen from the ones
-                   nmcli reports. Leave it empty to let NetworkManager pick.
+                   nmcli reports. Leave it empty to let NetworkManager pick;
+                   on a re-run Enter keeps the stored one and '-' clears it.
   WIFI_HIDDEN      Whether the network broadcasts its SSID. Defaults to no.
   Interval         How often cron runs the job. Defaults to 5 minutes, and
                    must divide 60 evenly.
 
 Re-running it is safe: the current settings become the defaults, and the
 previous config.env is kept as config.env.bak, at mode 600 like the config
-itself.
+itself. If the test fails while a cron job of this checkout is installed, the
+previous config.env is put back (or a new one removed), so the job keeps
+reading what it read before.
 
 Environment:
   Any RECONNECT_* setting already on the installed cron line is used when the
@@ -130,11 +151,15 @@ Environment:
 
 All of those are checked before the first question, as is whether config.env can
 actually be read and written (and, when it already exists, whether its backup
-can be written beside it), whether this checkout's own path can be written onto
-a cron line, and whether crontab is installed at all, so a run that cannot work
-is refused rather than found out at the end of the interview. The checkout path is checked first: when
-RECONNECT_CONFIG is unset the config lives beside the script, so a checkout
-path that cannot be installed is the reason the config path cannot be either.
+can be written beside it), whether the log directory (the default logs/ too)
+and today's log file in it can be written, whether this checkout's own path can
+be written onto a cron line, whether crontab is installed and your crontab can
+be read, and
+whether the commands install-cron.sh needs (mktemp, awk, rm, date) are there,
+so a run that cannot work is refused rather than found out at the end of the
+interview. The checkout path is checked first: when RECONNECT_CONFIG is unset
+the config lives beside the script, so a checkout path that cannot be installed
+is the reason the config path cannot be either.
 USAGE
 }
 
@@ -213,9 +238,9 @@ fi
 # verification run and install-cron.sh all see one value. The environment still
 # wins, because that is the documented way to move a setting.
 #
-# Read through `crontab -l` with its failure treated as "no line": this is a
-# lookup for defaults, not a decision to write, and install-cron.sh does its
-# own guarded read before it touches anything. The line is recognised the way
+# Read through `crontab -l`, where "no crontab yet" means "no line" and any other
+# failed read is refused before the interview (see the read below). The line is
+# recognised the way
 # uninstall-cron.sh recognises it -- not a comment, carries the marker, names
 # this checkout's reconnect.sh -- and the value is taken off it the way
 # install-cron.sh's previous_value() takes it: single-quoted when we wrote it,
@@ -230,28 +255,111 @@ fi
 # inside /mnt/backup/home/u/ir): a plain re-run here then took that job's
 # RECONNECT_CONFIG, rewrote *its* config.env with these answers, and exited 0.
 names_our_script() {
-    local word
-    case "$1" in
-        *"'$RECONNECT'"* | *"\"$RECONNECT\""*) return 0 ;;
-    esac
+    local word path
+    for path in "$RECONNECT" "$RECONNECT_ALIAS"; do
+        case "$1" in
+            *"'$path'"* | *"\"$path\""*) return 0 ;;
+        esac
+    done
     local -a words
     read -r -a words <<< "$1"
     for word in "${words[@]}"; do
         [ "$word" != "$RECONNECT" ] || return 0
+        [ "$word" != "$RECONNECT_ALIAS" ] || return 0
     done
     return 1
 }
 
+# True when install-cron.sh's ours() would claim $1 as its own line: the marker at
+# the very end once trailing blanks are gone (marked()), and this checkout's
+# reconnect.sh single-quoted or as a whole blank-delimited word (names_target()).
+# Comments are skipped by the caller, as marked() skips them. Stricter than
+# names_our_script() on purpose -- no double-quoted spelling, no marker mid-line --
+# because this one predicts what that script will do, not what is worth reporting.
+installer_claims() {
+    local line="${1%"${1##*[![:space:]]}"}" word path
+    case "$line" in *"$MARKER") ;; *) return 1 ;; esac
+    for path in "$RECONNECT" "$RECONNECT_ALIAS"; do
+        case "$1" in *"'$path'"*) return 0 ;; esac
+    done
+    local -a words
+    read -r -a words <<< "$1"
+    for word in "${words[@]}"; do
+        [ "$word" != "$RECONNECT" ] || return 0
+        [ "$word" != "$RECONNECT_ALIAS" ] || return 0
+    done
+    return 1
+}
+
+# True when crontab's diagnostic says there is simply no crontab yet -- the
+# same case-folded test install-cron.sh's mentions_no_crontab() makes, so the
+# two scripts agree about which failed reads are really the empty case,
+# BusyBox's "can't open '<user>': No such file or directory" included (see the
+# comment on that function for why only that exact shape is taken).
+mentions_no_crontab() {
+    case "$1" in
+        *[Nn][Oo]" "[Cc][Rr][Oo][Nn][Tt][Aa][Bb]*) return 0 ;;
+        *"can't open '"*"': No such file or directory"*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+# A read that fails for any reason other than "no crontab yet" is refused here,
+# before the interview, and no longer treated as "no line". The lookup itself
+# only fills in defaults, but install-cron.sh refuses to write over a crontab
+# it cannot read, so a run whose read fails cannot finish -- and treating the
+# failure as "no line" let it ask every question, take the Wi-Fi password, write
+# config.env and pass the verification before install-cron.sh refused at the
+# very end. Measured with crontab -l answering "You (tester) are not allowed to
+# use this program (crontab)", which is what cron.allow/cron.deny produce. The
+# test is install-cron.sh's, condition for condition. stderr is fetched with a
+# second read rather than a temporary file, since this script needs none
+# anywhere else.
+#
+# "Condition for condition" includes what counts as stderr being non-empty.
+# install-cron.sh asks `[ -s "$cron_err" ]` of the file, which is true for a
+# single newline; a command substitution strips trailing newlines, so here the
+# same newline-only diagnostic used to come back as "" and pass as "no crontab
+# yet" -- and the interview, the password and the config were all spent before
+# install-cron.sh refused it. The `printf x` sentinel keeps the bytes exactly as
+# crontab wrote them, so `-n` here and `-s` there agree.
+#
+# Two lines are looked for, because two different questions are asked of the
+# crontab. $installed_line is the first line of this checkout's by the loose rule
+# above, and it is what the settings are carried off: a line a hand-edit took past
+# what install-cron.sh recognises still names the config and log directory the
+# job is using. $installer_line is the first line install-cron.sh's ours() would
+# claim -- the one whose interval it carries across a re-install -- and only that
+# one can say what pressing Enter at the interval prompt will install. Using the
+# loose line for that too promised "keep the interval already installed" over a
+# line edited after the marker, where install-cron.sh leaves the line alone and
+# installs a second job every 5 minutes beside it.
 installed_line=""
+installer_line=""
 if command -v crontab >/dev/null 2>&1; then
-    installed_crontab="$(LC_ALL=C crontab -l 2>/dev/null || true)"
+    installed_crontab=""
+    cron_read_rc=0
+    installed_crontab="$(LC_ALL=C crontab -l 2>/dev/null)" || cron_read_rc=$?
+    if [ "$cron_read_rc" -ne 0 ]; then
+        cron_read_err="$(LC_ALL=C crontab -l 2>&1 >/dev/null; printf x)"
+        cron_read_err="${cron_read_err%x}"
+        if [ "$cron_read_rc" -ne 1 ] || [ -n "$installed_crontab" ] \
+            || { [ -n "$cron_read_err" ] && ! mentions_no_crontab "$cron_read_err"; }; then
+            # As written, the way install-cron.sh passes its file on with `cat`.
+            [ -z "$cron_read_err" ] || printf '%s' "$cron_read_err" >&2
+            die "could not read the current crontab (crontab -l exited $cron_read_rc). install-cron.sh refuses to write over a crontab it cannot read, so the job could not be installed. Nothing was asked for, so nothing is lost -- fix that (cron.allow and cron.deny are the usual cause) and run this again."
+        fi
+        installed_crontab=""
+    fi
     while IFS= read -r cron_line; do
         stripped="${cron_line#"${cron_line%%[![:space:]]*}"}"
         case "$stripped" in '#'*) continue ;; esac
         case "$cron_line" in *"$MARKER"*) ;; *) continue ;; esac
         names_our_script "$cron_line" || continue
-        installed_line="$cron_line"
-        break
+        [ -n "$installed_line" ] || installed_line="$cron_line"
+        if [ -z "$installer_line" ] && installer_claims "$cron_line"; then
+            installer_line="$cron_line"
+        fi
     done <<< "$installed_crontab"
 fi
 
@@ -461,6 +569,31 @@ check_cron_safe() {
 command -v crontab >/dev/null 2>&1 \
     || die "crontab not found. Install cron (e.g. 'sudo apt install cron'); it is what schedules the job. Nothing was asked for, so nothing is lost -- install it and run this again."
 
+# The rest of install-cron.sh's install preflights, for the reason crontab is
+# checked just above. That script refuses outright without mktemp, awk or rm,
+# and without date on an install, and this run always ends in an install. Two
+# of the four were caught only by accident and two not at all: reconnect.sh
+# needs awk and date too, so a missing one failed the verification run -- after
+# the interview -- while mktemp and rm are nothing reconnect.sh needs, so a
+# machine without either answered every question, read the password, wrote
+# config.env, printed "Settings work" and was then refused by install-cron.sh
+# with "mktemp not found". Checked in install-cron.sh's order, after crontab,
+# so a machine missing several is told about the same one first.
+for setup_tool in mktemp awk rm date; do
+    command -v "$setup_tool" >/dev/null 2>&1 \
+        || die "$setup_tool not found. Install it (coreutils or your distro's package); install-cron.sh needs it to install the job. Nothing was asked for, so nothing is lost -- install it and run this again."
+done
+
+# The file the verification run reports its outcome into (reconnect.sh's
+# IR_OUTCOME_FILE; see the readback below for why the day log is not used).
+# Made here rather than beside the run, because a mktemp that fails -- a TMPDIR
+# that does not exist, say -- is a run that cannot finish, and install-cron.sh
+# would fail on the same mktemp at the end anyway. Single quotes so the path is
+# expanded when the trap runs, as install-cron.sh's own trap does it.
+verify_outcome="$(mktemp)" \
+    || die "could not create a temporary file (mktemp failed -- check TMPDIR); the settings test and install-cron.sh both need one. Nothing was asked for, so nothing is lost -- fix that and run this again."
+trap 'rm -f "$verify_outcome"' EXIT
+
 # The install path is one of the four values install-cron.sh vets with the
 # crontab-safety rule. It is not a setting -- it is where this checkout happens
 # to sit -- and install-cron.sh vets it in exactly this position too,
@@ -546,6 +679,11 @@ if [ -e "$CONFIG_FILE" ]; then
     # interview, which is exactly what this block exists to save.
     [ -w "$config_dir" ] || [ -w "$CONFIG_FILE.bak" ] \
         || die "cannot write into $config_dir (check its owner and mode), so the backup $CONFIG_FILE.bak could not be created before $CONFIG_FILE is overwritten. Nothing was asked for, so nothing is lost -- fix the permissions and run this again."
+    # And the command that makes the backup. This was checked only at the `cp`
+    # itself, after the whole interview and the password -- the one need of
+    # this branch left for the far end, on a run that could never get past it.
+    command -v cp >/dev/null 2>&1 \
+        || die "cp not found. Install coreutils; it is what backs up the existing $CONFIG_FILE before it is overwritten. Nothing was asked for, so nothing is lost -- install it and run this again."
 else
     [ -d "$config_dir" ] \
         || die "the directory for RECONNECT_CONFIG does not exist: $config_dir. Create it, or point RECONNECT_CONFIG somewhere that does."
@@ -565,33 +703,68 @@ if [ -n "${RECONNECT_LOG_DIR:-}" ]; then
     esac
     log_dir_cron_reason="$(check_cron_safe "$RECONNECT_LOG_DIR")" \
         || die "RECONNECT_LOG_DIR $log_dir_cron_reason"
+fi
 
-    # Whether the directory can exist at all, which is the check the config
-    # path gets above and this one did not. reconnect.sh creates the log
-    # directory on demand, so a missing one is fine -- but it treats one it
-    # *cannot* create as non-fatal by design (status() warns on stderr and the
-    # run carries on as though it had logged), so the verification run below
-    # passed over a directory under a parent the user cannot write, this
-    # script printed "Settings work", and the job it installed reconnected
-    # every interval without ever writing a line -- with the warning going to
-    # /dev/null under cron. Measured: RECONNECT_LOG_DIR pointed under a
-    # mode-555 directory installed cleanly and the directory stayed empty.
-    #
-    # The test is on the nearest ancestor that exists: `mkdir -p` succeeds
-    # exactly when that ancestor is a writable directory. `-w` is the same
-    # prediction the config-path check makes, and the readback after the
-    # verification run is what catches the cases it gets wrong.
-    log_dir_probe="$RECONNECT_LOG_DIR"
-    while [ ! -e "$log_dir_probe" ]; do
-        case "$log_dir_probe" in
-            */*) log_dir_probe="${log_dir_probe%/*}"; [ -n "$log_dir_probe" ] || log_dir_probe=/ ;;
-            *) log_dir_probe=/ ;;
-        esac
-    done
-    [ -d "$log_dir_probe" ] \
-        || die "RECONNECT_LOG_DIR cannot be created: $log_dir_probe exists and is not a directory. reconnect.sh would run without ever writing a log line."
+# The directory the verification run, and then the job, will log into --
+# resolved the way reconnect.sh resolves it.
+VERIFY_LOG_DIR="${RECONNECT_LOG_DIR:-$SCRIPT_DIR/logs}"
+
+# Whether that directory can exist at all, which is the check the config path
+# gets above. reconnect.sh creates the log directory on demand, so a missing one
+# is fine -- but it treats one it *cannot* create as non-fatal by design
+# (status() warns on stderr and the run carries on as though it had logged), so
+# the verification run passed over a directory under a parent the user cannot
+# write, this script printed "Settings work", and the job it installed
+# reconnected every interval without ever writing a line -- with the warning
+# going to /dev/null under cron. Measured: RECONNECT_LOG_DIR pointed under a
+# mode-555 directory installed cleanly and the directory stayed empty.
+#
+# For the default directory as well as an explicit RECONNECT_LOG_DIR. This used
+# to sit inside the RECONNECT_LOG_DIR branch, so with the setting unset nothing
+# looked at <checkout>/logs at all: a checkout whose logs/ could not be written
+# asked every question and took the Wi-Fi password, and only then was the
+# verification refused as having written no line. The name in the messages
+# follows which one it is, so a user who never set RECONNECT_LOG_DIR is not told
+# that it is wrong.
+#
+# The test is on the nearest ancestor that exists: `mkdir -p` succeeds exactly
+# when that ancestor is a writable directory. `-w` is the same prediction the
+# config-path check makes, and the readback after the verification run is what
+# catches the cases it gets wrong.
+if [ -n "${RECONNECT_LOG_DIR:-}" ]; then
+    log_dir_name=RECONNECT_LOG_DIR
+else
+    log_dir_name="The log directory $VERIFY_LOG_DIR"
+fi
+log_dir_probe="$VERIFY_LOG_DIR"
+while [ ! -e "$log_dir_probe" ]; do
+    case "$log_dir_probe" in
+        */*) log_dir_probe="${log_dir_probe%/*}"; [ -n "$log_dir_probe" ] || log_dir_probe=/ ;;
+        *) log_dir_probe=/ ;;
+    esac
+done
+[ -d "$log_dir_probe" ] \
+    || die "$log_dir_name cannot be created: $log_dir_probe exists and is not a directory. reconnect.sh would run without ever writing a log line."
+if [ "$log_dir_probe" = "$VERIFY_LOG_DIR" ]; then
     [ -w "$log_dir_probe" ] \
-        || die "RECONNECT_LOG_DIR cannot be created: $log_dir_probe is not writable (check its owner and mode). reconnect.sh would run without ever writing a log line, and under cron the warning saying so goes to /dev/null."
+        || die "$log_dir_name exists but is not writable: $log_dir_probe (check its owner and mode). reconnect.sh would run without ever writing a log line, and under cron the warning saying so goes to /dev/null. Nothing was asked for, so nothing is lost -- fix that and run this again."
+else
+    [ -w "$log_dir_probe" ] \
+        || die "$log_dir_name cannot be created: $log_dir_probe is not writable (check its owner and mode). reconnect.sh would run without ever writing a log line, and under cron the warning saying so goes to /dev/null."
+fi
+
+# Today's log file, which is the one the verification run appends to. A
+# directory that can be written is not enough: a day file left by an earlier
+# `sudo ./reconnect.sh` -- the ordinary way to get one, as the readback comment
+# further down says -- is root's and cannot be appended to, so the run logs
+# nothing, its outcome is empty and the setup is refused. That used to be
+# discovered after the whole interview and the password. It is a prediction
+# about one date: a run that crosses midnight appends to a new file, and the
+# readback still catches what this misses.
+verify_day_log="$VERIFY_LOG_DIR/$(date '+%Y-%m-%d').log"
+if [ -e "$verify_day_log" ]; then
+    { [ -f "$verify_day_log" ] && [ -w "$verify_day_log" ]; } \
+        || die "today's log file $verify_day_log cannot be written to (check its owner and mode -- a file left by an earlier 'sudo ./reconnect.sh' is the usual cause). The settings test appends its outcome there, and so would the job. Nothing was asked for, so nothing is lost -- fix that and run this again."
 fi
 
 # CRON_PATH is the third value install-cron.sh vets with the rule above, and it
@@ -666,7 +839,7 @@ fi
 
 # --- Asking -------------------------------------------------------------------
 # Every prompt goes through here so that end-of-input is a stated failure exactly
-# once rather than at fifteen call sites.
+# once rather than at each prompt that reads through it.
 #
 # There is deliberately no `[ -t 0 ]` check. uninstall-cron.sh refuses to delete
 # logs without a terminal, and that is right there because the alternative is
@@ -689,9 +862,17 @@ fi
 # quietly rewrite an SSID with a padding space, which this project deliberately
 # supports: config_value() preserves those when the value is quoted, and the
 # suite pins it. What the user typed is what gets written.
+#
+# End of input is "read failed and nothing arrived", not "read failed". `read`
+# also returns 1 for a last answer that has no newline after it -- the reply is
+# assigned all the same -- and that answer used to be thrown away as end of
+# input: `printf 'MyNet\npw\n\nno\n10' | ./auto-setup.sh` asked every question,
+# took the password and was then refused at the interval prompt, writing nothing.
+# load_config() in reconnect.sh and existing_value() below have always read an
+# unterminated last line the same way. The password prompt applies the same rule.
 ask() {
-    local prompt="$1" reply
-    IFS= read -r -p "$prompt" reply || die "no more input (end of file) while asking: $prompt
+    local prompt="$1" reply=""
+    IFS= read -r -p "$prompt" reply || [ -n "$reply" ] || die "no more input (end of file) while asking: $prompt
 Run this from a terminal, or write $CONFIG_FILE by hand from $EXAMPLE and then run ./manual-setup/install-cron.sh."
     printf '%s' "$reply"
 }
@@ -833,16 +1014,29 @@ done
 # back. It is not asked for twice: a typo is caught a few steps below by the
 # verification run, which reports nmcli's own reason with the password scrubbed
 # out, and that is a better check than asking someone to type it identically
-# twice.
+# twice -- but only when that run actually uses it. A run that finds the machine
+# already on the network logs "Wifi Good" and never reaches the connect, and one
+# that reconnects through a saved profile never reaches the password form, so in
+# both the password goes untested. The first of those is visible in the log line
+# and is said out loud after the run; see the note beside the readback.
 #
 # Skippable, and said so out loud, because WIFI_PASSWORD is genuinely optional
 # and SECURITY.md steers people away from it: once NetworkManager has a saved
 # profile, `nmcli connection up` needs no password, so the setting can stay empty
 # and the secret never enters this file at all.
+#
+# On a re-run Enter keeps the stored password, so it cannot also mean "none":
+# '-' is the answer that removes it. Without one, a password once stored could
+# never be taken out again by this script -- the route SECURITY.md recommends
+# (leave WIFI_PASSWORD empty and rely on the saved profile) was closed to
+# anyone who had used it before. '-' cannot be a real Wi-Fi password: a WPA
+# passphrase is 8 to 63 characters, and a WEP key is never one. It means "no
+# password" on a first run too, so the same answer works either way.
 echo
 echo "Wi-Fi password. This is optional:"
 if [ "$had_password" -eq 1 ]; then
     echo "  * press Enter to keep the password already in $CONFIG_FILE,"
+    echo "  * type - to remove it and rely on the saved NetworkManager profile,"
     echo "  * or type a new one to replace it."
 else
     echo "  * leave it empty if NetworkManager already has a saved profile for"
@@ -853,14 +1047,19 @@ fi
 password=""
 keep_password=0
 IFS= read -r -s -p "Wi-Fi password: " password \
-    || die "no more input (end of file) while asking for the password.
+    || [ -n "$password" ] || die "no more input (end of file) while asking for the password.
 Run this from a terminal, or write $CONFIG_FILE by hand from $EXAMPLE and then run ./manual-setup/install-cron.sh."
 echo
 if [ -z "$password" ] && [ "$had_password" -eq 1 ]; then
     keep_password=1
     password="$(existing_value WIFI_PASSWORD || true)"
     echo "  Keeping the existing password."
-elif [ -z "$password" ]; then
+elif [ "$password" = "-" ] && [ "$had_password" -eq 1 ]; then
+    password=""
+    echo "  Removing the stored password. The saved NetworkManager profile will be used."
+    echo "  $CONFIG_FILE.bak will still hold the old one; delete it once this run succeeds."
+elif [ -z "$password" ] || [ "$password" = "-" ]; then
+    password=""
     echo "  No password stored. The saved NetworkManager profile will be used."
 fi
 
@@ -884,23 +1083,39 @@ if command -v nmcli >/dev/null 2>&1; then
     done < <(nmcli -t -f DEVICE,TYPE device 2>/dev/null || true)
 fi
 
+#
+# With a device already set, Enter keeps it, so "leave it empty" cannot also be
+# how to go back to automatic -- and the screen used to say it was, then kept
+# the old device. '-' is the answer that clears it, as at the password prompt;
+# the text above the prompt says which of the two Enter means on this run.
 echo
 iface=""
 if [ "${#wifi_devices[@]}" -eq 0 ]; then
     # No list to offer: either nmcli is absent, or it reports no Wi-Fi device.
     # Neither is a reason to refuse -- the setting is optional and the machine
     # may simply not have its adapter up yet -- so fall back to a typed name.
-    echo "Wi-Fi interface. Leave empty to let NetworkManager pick the device,"
-    echo "which is the usual answer. ('nmcli device status' lists them.)"
     if [ -n "$old_iface" ]; then
+        echo "Wi-Fi interface. Press Enter to keep $old_iface, or type - to let"
+        echo "NetworkManager pick the device. ('nmcli device status' lists them.)"
         iface="$(ask_trimmed "Interface [$old_iface]: ")"
-        [ -n "$iface" ] || iface="$old_iface"
+        case "$iface" in
+            '') iface="$old_iface" ;;
+            -) iface="" ;;
+        esac
     else
+        echo "Wi-Fi interface. Leave empty to let NetworkManager pick the device,"
+        echo "which is the usual answer. ('nmcli device status' lists them.)"
         iface="$(ask_trimmed "Interface []: ")"
+        [ "$iface" != "-" ] || iface=""
     fi
 else
-    echo "Wi-Fi interface. Leave empty (just press Enter) to let NetworkManager"
-    echo "pick, which is the usual answer. Detected Wi-Fi devices:"
+    if [ -n "$old_iface" ]; then
+        echo "Wi-Fi interface. Press Enter to keep $old_iface, or type - to let"
+        echo "NetworkManager pick. Detected Wi-Fi devices:"
+    else
+        echo "Wi-Fi interface. Leave empty (just press Enter) to let NetworkManager"
+        echo "pick, which is the usual answer. Detected Wi-Fi devices:"
+    fi
     i=1
     for dev in "${wifi_devices[@]}"; do
         if [ "$dev" = "$old_iface" ]; then
@@ -912,12 +1127,14 @@ else
     done
     while true; do
         if [ -n "$old_iface" ]; then
-            iface="$(ask_trimmed "Number, name, or Enter to keep [$old_iface]: ")"
+            iface="$(ask_trimmed "Number, name, - for automatic, or Enter to keep [$old_iface]: ")"
             [ -n "$iface" ] || { iface="$old_iface"; break; }
         else
             iface="$(ask_trimmed "Number, name, or Enter for automatic: ")"
             [ -n "$iface" ] || break
         fi
+        # Ahead of the case below, which would take '-' as a device name.
+        [ "$iface" != "-" ] || { iface=""; break; }
         # A number selects from the list; anything else is taken as a device
         # name, so a device nmcli did not report can still be named by hand.
         #
@@ -1031,37 +1248,80 @@ else
     # first run here said "Press Enter for every 5 minutes" and then installed
     # the 10 the line already carried. The interval is read off the line the
     # way install-cron.sh's previous_minutes() reads it, so the prompt can name
-    # it; a line whose schedule is not `*/N` falls back to the general wording.
+    # it; a line whose interval install-cron.sh will not carry is reported as
+    # such instead (see below).
+    #
+    # The interval read off the line is held to check_interval() too, because
+    # install-cron.sh validates it before keeping it. A hand-edited `*/7` used
+    # to be offered here as "Press Enter to keep the interval already installed
+    # (every 7 minutes)", and pressing Enter ran the verification, printed
+    # "Settings work" and was then refused by install-cron.sh with "must divide
+    # 60 evenly" -- after the interview, over a default this script had offered,
+    # with closing advice to re-run install-cron.sh, which fails the same way. A
+    # value wider than two digits (`*/123`) took a general "keep" wording and
+    # met the same refusal. Such an interval is now said to be unusable, and
+    # Enter means 5, passed to install-cron.sh explicitly so that it never
+    # validates the line's interval at all.
+    #
+    # The field is taken whole, as previous_minutes() takes it, and
+    # check_interval() applies the width rule before any arithmetic.
+    #
+    # Read off $installer_line, the line install-cron.sh will itself carry, and
+    # never off the loose $installed_line. Every installed line therefore ends in
+    # one of two answers: an interval that is kept and named, or a stated reason
+    # it cannot be kept, with Enter meaning 5. There used to be a third, "Press
+    # Enter to keep the interval already installed." with no figure, for a line
+    # whose schedule was not `*/N` -- and install-cron.sh keeps nothing there:
+    # previous_minutes() reads only `*/N`, so a hand-made `0,30 * * * *` was
+    # replaced by `*/5` right after the promise to keep it. A line edited past
+    # what ours() recognises got the promise too, interval named and all, and
+    # install-cron.sh then left it and installed a second job every 5 minutes.
     installed_minutes=""
-    if [ -n "$installed_line" ]; then
-        installed_minutes="${installed_line#"${installed_line%%[![:space:]]*}"}"
-        case "$installed_minutes" in
+    installed_minutes_reason=""
+    if [ -n "$installer_line" ]; then
+        installed_field="${installer_line#"${installer_line%%[![:space:]]*}"}"
+        case "$installed_field" in
             '*/'*)
-                installed_minutes="${installed_minutes%%[[:space:]]*}"
-                installed_minutes="${installed_minutes#\*/}"
-                # One or two digits only: every legal interval fits, and a
-                # hand-edited wider value is never fed to `$(( ))`, which wraps.
-                case "$installed_minutes" in
-                    [0-9] | [0-9][0-9]) installed_minutes="$((10#$installed_minutes))" ;;
-                    *) installed_minutes="" ;;
+                installed_field="${installed_field%%[[:space:]]*}"
+                installed_field="${installed_field#\*/}"
+                case "$installed_field" in
+                    '' | *[!0-9]*)
+                        installed_minutes_reason="install-cron.sh keeps only an every-N-minutes schedule, and '*/$installed_field' is not one." ;;
+                    *)
+                        if ! installed_minutes="$(check_interval "$installed_field")"; then
+                            installed_minutes_reason="install-cron.sh would refuse it: $installed_minutes"
+                            installed_minutes=""
+                        fi
+                        ;;
                 esac
                 ;;
-            *) installed_minutes="" ;;
+            *)
+                read -r sched_1 sched_2 sched_3 sched_4 sched_5 _ <<< "$installer_line"
+                installed_minutes_reason="install-cron.sh keeps only an every-N-minutes schedule, and '$sched_1 $sched_2 $sched_3 $sched_4 $sched_5' is not one."
+                ;;
         esac
+    elif [ -n "$installed_line" ]; then
+        installed_minutes_reason="that line was edited past what install-cron.sh recognises as its own, so it is left in place and a new line is installed beside it."
     fi
     if [ -n "$installed_minutes" ]; then
         echo "Run how often? Press Enter to keep the interval already installed"
         echo "(every $installed_minutes minutes)."
-    elif [ -n "$installed_line" ]; then
-        echo "Run how often? Press Enter to keep the interval already installed."
+    elif [ -n "$installed_minutes_reason" ]; then
+        echo "The interval on the installed cron line cannot be kept, because"
+        echo "$installed_minutes_reason"
+        echo "Run how often? Press Enter for every 5 minutes."
     else
         echo "Run how often? Press Enter for every 5 minutes."
     fi
     while true; do
         answer="$(ask_trimmed "Interval in minutes: ")"
         # Empty means "let install-cron.sh decide", so there is nothing to
-        # validate and nothing to pass.
-        [ -n "$answer" ] || break
+        # validate and nothing to pass -- except where the installed interval
+        # cannot be kept, where Enter means the 5 the prompt just offered.
+        if [ -z "$answer" ]; then
+            [ -z "$installed_minutes_reason" ] || minutes=5
+            break
+        fi
         # The rules, the wording and the normalisation all live in
         # check_interval(); on success $minutes is the value it normalised, on
         # failure it is the reason, which is printed and then cleared so that a
@@ -1077,8 +1337,7 @@ fi
 # --- Write the config ---------------------------------------------------------
 echo
 if [ "$had_config" -eq 1 ]; then
-    command -v cp >/dev/null 2>&1 \
-        || die "cp not found. Install coreutils (there is an existing $CONFIG_FILE to back up first)."
+    # `cp` is checked before the interview, beside the backup's other needs.
     cp -- "$CONFIG_FILE" "$CONFIG_FILE.bak" \
         || die "could not back up $CONFIG_FILE to $CONFIG_FILE.bak; nothing was changed."
     # The backup gets mode 600 of its own, and not only by inheritance. `cp`
@@ -1190,107 +1449,156 @@ printf '  WIFI_HIDDEN   %s\n' "$hidden"
 # password nmcli refused: exit 0, "Settings work", one job in the crontab; the
 # same answers with the lock free were refused.
 #
-# So the line is read back, the way the README says to read a day's log. The
-# directory is resolved exactly as reconnect.sh resolves it, and the day is
-# taken on both sides of the run so a run that crosses midnight still finds
-# its line.
+# So the outcome this run logged is read back, and it has to be *this run's*.
+# Two earlier versions read it out of the day file, and both let another line
+# stand in for it:
 #
-# Read back *positively*: the line counted is one that was appended by this
-# run, not whatever happens to be last in the file. The first version took the
-# last line, and that reopened the door it had just closed: reconnect.sh treats
-# a day file it cannot append to as a warning and carries on (status() -- a
-# file created by an earlier `sudo ./reconnect.sh` is the ordinary way to get
-# one), so with the lock held and a stale "Wifi Good" sitting at the end of
-# that file, a wrong password was installed under "Settings work" again -- and
-# with a stale "FAIL" there, a run that had genuinely tested the settings was
-# refused with advice about the log directory. Counting the day file's lines
-# before the run and taking only a line past that count is what ties the
-# readback to this run. "No new line" is refused too: it means the run could
-# not record its outcome at all -- a log directory it could not create, a day
-# file it could not open -- and a job that cannot log is the silence every
-# check here exists to prevent.
+#   * The last line in the file. reconnect.sh treats a day file it cannot
+#     append to as a warning and carries on (a file left by an earlier
+#     `sudo ./reconnect.sh` is the ordinary way to get one), so a stale
+#     "Wifi Good" at the end installed a wrong password under "Settings work",
+#     and a stale "FAIL" refused settings that had been tested.
+#   * The first line past a count taken before the run. That shut out stale
+#     lines but not concurrent ones: the installed job appends to the same
+#     file. Measured with stubs: a scheduled run stepping aside mid-verification
+#     put "Skipped (already running)" first, and a verification that had
+#     reconnected was refused as untested; one finishing in the instant before
+#     the verification found the lock held put its "Wifi Good" first, and a
+#     verification that never ran nmcli installed a wrong password under
+#     "Settings work".
 #
-# Built-in reads only: `date` is required by reconnect.sh itself, so a run
-# that reached this point had it, and the lines are counted with `read`
-# rather than `wc` or `tail`, which this script does not otherwise need.
-VERIFY_LOG_DIR="${RECONNECT_LOG_DIR:-$SCRIPT_DIR/logs}"
+# So the run is handed a file of its own (IR_OUTCOME_FILE, made before the
+# interview), and reconnect.sh's status() writes the outcome there after its
+# day-file append succeeds. Nothing else has that path. An empty file is
+# refused: the run could not record its outcome at all -- a log directory it
+# could not create, a day file it could not append to -- and a job that cannot
+# log is the silence every check here exists to prevent.
 #
-# A day file that exists but cannot be opened for reading -- another owner at
-# mode 600, left by an earlier `sudo ./reconnect.sh` -- is read as "no line",
-# which the readback below reports as a run it could not confirm. Both reads
-# used to be bare, so the failed redirect printed bash's own `line NNN: ...:
-# Permission denied` and, inside the `verify_line=` assignment, ended the run
-# under `set -e` with exit 1 and no stated reason, after config.env had
-# already been written. `2>/dev/null` comes before the `<` for the reason the
-# config write further up orders its own redirections that way: left to right,
-# the other order reports the failed open before stderr is silenced.
+# Read with the builtin, `2>/dev/null` ahead of the `<` for the reason the
+# config write orders its redirections that way, and never fatal.
 #
-# Non-empty lines in $1; 0 when it does not exist or cannot be read.
-log_line_count() {
-    local line n=0
-    if [ -f "$1" ]; then
-        while IFS= read -r line || [ -n "$line" ]; do
-            [ -z "$line" ] || n=$((n + 1))
-        done 2>/dev/null < "$1" || n=0
+# A refusal below must also leave an installed job reading what it read before.
+# The config is written ahead of this run, and the job that is already in the
+# crontab reads that same file -- so a re-run refused here used to say "the cron
+# job was NOT installed" and "$CONFIG_FILE has been kept" while the job it had
+# not installed was already running on the refused settings. Measured with
+# stubs: a working job, then a re-run with the SSID mistyped, refused as it
+# should be -- and the job's next run logged FAIL, every interval after that,
+# with the reason going to /dev/null. With the lock held it was the untested
+# case again: "the settings were NOT tested", and the job then ran on the
+# password just typed. Writing the file only after the run passes would mean
+# testing a different path from the one the job reads, so the write stays where
+# it is and a refusal undoes it instead -- but only where a job of this
+# checkout's is installed. With none there is nothing that reads the file, and
+# keeping it is what lets a re-run offer the answers just given as defaults.
+config_put_back=0
+put_back_config() {
+    if [ -z "$installed_line" ]; then
+        echo "$CONFIG_FILE has been kept:" >&2
+        echo "on a re-run each current value is offered as the default, so only" >&2
+        echo "the wrong one has to be retyped." >&2
+        return 0
     fi
-    printf '%s' "$n"
-}
-# The outcome on the first non-empty line of $1 past the first $2 of them, with
-# the [HH:MM:SS] prefix stripped; empty when no such line exists or the file
-# cannot be read.
-log_line_after() {
-    local line n=0
-    [ -f "$1" ] || return 0
-    while IFS= read -r line || [ -n "$line" ]; do
-        [ -n "$line" ] || continue
-        n=$((n + 1))
-        if [ "$n" -gt "$2" ]; then
-            printf '%s' "${line#\[*\] }"
+    config_put_back=1
+    if [ "$had_config" -eq 1 ]; then
+        if cp -- "$CONFIG_FILE.bak" "$CONFIG_FILE" 2>/dev/null; then
+            echo "The installed cron job reads $CONFIG_FILE, so the previous config" >&2
+            echo "has been put back from $CONFIG_FILE.bak and the job carries on with" >&2
+            echo "the settings it had. A re-run offers those as the defaults, so give" >&2
+            echo "your change again." >&2
             return 0
         fi
-    done 2>/dev/null < "$1" || true
+        echo "WARNING: could not put the previous config back from $CONFIG_FILE.bak." >&2
+        echo "         The installed cron job now reads the settings above, which did" >&2
+        echo "         not pass. Restore it yourself:" >&2
+        echo "           cp '$CONFIG_FILE.bak' '$CONFIG_FILE'" >&2
+        return 0
+    fi
+    if rm -f -- "$CONFIG_FILE" 2>/dev/null; then
+        echo "The installed cron job reads $CONFIG_FILE, which did not exist before" >&2
+        echo "this run, so it has been removed again and the job finds no config, as" >&2
+        echo "it did before. A re-run asks for every setting again." >&2
+        return 0
+    fi
+    echo "WARNING: could not remove $CONFIG_FILE again. The installed cron job now" >&2
+    echo "         reads the settings above, which did not pass. Remove it yourself." >&2
     return 0
 }
+
+# The install-cron.sh command a refusal below tells the user to run by hand,
+# carrying what this run would have handed it: the interval chosen at the prompt
+# and every setting in the environment, the ones carried off the cron line
+# included. The advice used to be a bare `./manual-setup/install-cron.sh`, and
+# followed literally that is a different install: MINUTES typed at the prompt
+# exists only in this script, so the job went in at the interval already on the
+# line (or 5) rather than the one just chosen -- measured, a re-run answering 15
+# over a */10 job whose crontab write failed was told to run it, and it
+# reinstalled */10. A RECONNECT_CONFIG given only for this run was dropped the
+# same way, pointing the job at a config nobody had written.
+#
+# Single quotes are safe around every value: the paths and CRON_PATH were held
+# to check_cron_safe() before the interview, which refuses a single quote, and
+# the numeric settings and the interval are digits.
+install_command() {
+    local cmd="" setting
+    [ -z "$minutes" ] || cmd="MINUTES='$minutes' "
+    for setting in RECONNECT_CONFIG RECONNECT_LOG_DIR RECONNECT_LOG_RETENTION_DAYS \
+        RECONNECT_SCAN_WAIT_SECS RECONNECT_CONNECT_ATTEMPTS RECONNECT_NMCLI_WAIT_SECS \
+        CRON_PATH; do
+        [ -z "${!setting:-}" ] || cmd="$cmd$setting='${!setting}' "
+    done
+    printf '%s./manual-setup/install-cron.sh' "$cmd"
+}
+
+# VERIFY_LOG_DIR was resolved, and vetted, before the interview.
 echo
 echo "Testing the settings by running reconnect.sh once..."
 echo
-verify_day_before="$(date '+%Y-%m-%d' 2>/dev/null || true)"
-verify_count_before="$(log_line_count "$VERIFY_LOG_DIR/$verify_day_before.log")"
 verify_status=0
-RECONNECT_CONFIG="$CONFIG_FILE" bash "$RECONNECT" || verify_status=$?
-verify_day_after="$(date '+%Y-%m-%d' 2>/dev/null || true)"
+IR_OUTCOME_FILE="$verify_outcome" RECONNECT_CONFIG="$CONFIG_FILE" bash "$RECONNECT" \
+    || verify_status=$?
 
 verify_line=""
 if [ "$verify_status" -eq 0 ]; then
-    if [ "$verify_day_after" = "$verify_day_before" ]; then
-        verify_line="$(log_line_after "$VERIFY_LOG_DIR/$verify_day_after.log" "$verify_count_before")"
-    else
-        # Midnight passed during the run: the line is either the first in the
-        # new day's file or a late addition to the old one.
-        verify_line="$(log_line_after "$VERIFY_LOG_DIR/$verify_day_after.log" 0)"
-        [ -n "$verify_line" ] \
-            || verify_line="$(log_line_after "$VERIFY_LOG_DIR/$verify_day_before.log" "$verify_count_before")"
-    fi
+    IFS= read -r verify_line 2>/dev/null < "$verify_outcome" || true
     case "$verify_line" in
         "Skipped (already running)")
             echo >&2
             echo "Another reconnect.sh run was still in progress -- most likely the" >&2
             echo "scheduled job -- so this one stepped aside: the settings were NOT tested" >&2
-            echo "and the cron job was NOT installed. $CONFIG_FILE has been kept; wait" >&2
-            echo "for that run to finish (a failing one takes up to a few minutes) and" >&2
-            echo "re-run this script, pressing Enter to keep each answer." >&2
+            echo "and the cron job was NOT installed. Wait for that run to finish (a" >&2
+            echo "failing one takes up to a few minutes) and re-run this script." >&2
+            put_back_config
             exit 1
             ;;
-        "Wifi Good" | "Wifi Reconnected") ;;
+        "Wifi Good")
+            # Already on the network, so reconnect.sh never reached the connect
+            # and a password typed above was not used at all. "Settings work"
+            # follows, and the README used to promise that a wrong password is
+            # caught here; measured, a wrong one was installed under that line
+            # with nothing to say it had not been tried. Not a refusal: the
+            # settings that were exercised did work, and the usual reason to be
+            # connected while running this is that the network is the right one.
+            # Only for a password typed this run -- a kept one was said to be
+            # kept, and an empty one has nothing to test.
+            if [ -n "$password" ] && [ "$keep_password" -eq 0 ]; then
+                echo
+                echo "NOTE: this machine is already on $ssid, so the test did not need to"
+                echo "      connect and the password you typed was not tried. It is used only"
+                echo "      when a later run has to reconnect without a working saved profile;"
+                echo "      if it is wrong, that run will log FAIL."
+            fi
+            ;;
+        "Wifi Reconnected") ;;
         *)
             echo >&2
-            echo "reconnect.sh exited 0 but wrote no new line that could be read back from" >&2
+            echo "reconnect.sh exited 0 but wrote no new line to its log in" >&2
             echo "$VERIFY_LOG_DIR, so the settings could not be confirmed and the cron job" >&2
             echo "was NOT installed. A job that cannot write its log line would fail in" >&2
             echo "silence. Read the warning above (usually the log directory cannot be" >&2
-            echo "created, or today's log file cannot be written to or read -- check its" >&2
-            echo "owner and mode), fix it, and re-run this script;" >&2
-            echo "$CONFIG_FILE has been kept." >&2
+            echo "created, or today's log file cannot be written to -- check its owner" >&2
+            echo "and mode), fix it, and re-run this script." >&2
+            put_back_config
             exit 1
             ;;
     esac
@@ -1308,17 +1616,25 @@ if [ "$verify_status" -ne 0 ]; then
     # before the interview now, which narrows the case but does not close it,
     # because a missing command still reaches this line.
     echo "That did not work, so the cron job was NOT installed." >&2
-    echo "$CONFIG_FILE has been kept. Read the reason above:" >&2
+    put_back_config
+    echo "Read the reason above:" >&2
     echo "  * if it names one of the settings you just gave, re-run this script" >&2
-    echo "    -- each current value is offered as the default, so only the wrong" >&2
-    echo "    one has to be retyped;" >&2
+    echo "    and correct it;" >&2
     echo "  * if it names a missing command or something in your environment, fix" >&2
-    echo "    that instead. Your answers are already in the file, and re-running" >&2
+    echo "    that instead -- re-running with the same answers" >&2
     echo "    would fail the same way." >&2
     echo >&2
-    echo "Fix it and either re-run this script, or install the job directly:" >&2
-    echo "  ./auto-setup.sh" >&2
-    echo "  ./manual-setup/install-cron.sh" >&2
+    # install-cron.sh directly is only advice where the answers were kept: with
+    # the config put back, an install would schedule the old settings, which
+    # are already scheduled.
+    if [ "$config_put_back" -eq 1 ]; then
+        echo "Fix it and re-run this script:" >&2
+        echo "  ./auto-setup.sh" >&2
+    else
+        echo "Fix it and either re-run this script, or install the job directly:" >&2
+        echo "  ./auto-setup.sh" >&2
+        echo "  $(install_command)" >&2
+    fi
     exit 1
 fi
 
@@ -1339,8 +1655,20 @@ echo
 # moved up beside reconnect.sh's, ahead of the first prompt; see the comment
 # there. Nothing replaces it here, because a file that existed then and does
 # not now is not a case worth a second check -- the `|| die` below reports it.
+#
+# A failure here says what it left behind. It used to say "the cron job is not
+# installed" whatever was in the crontab, and on a re-run that is false: the job
+# of this checkout's that was already there stays, since install-cron.sh refuses
+# before it writes. The two cases are told apart the way put_back_config() tells
+# them apart.
+if [ -n "$installed_line" ]; then
+    install_failed="install-cron.sh failed, so the cron job was not updated; the one already installed was left as it was."
+else
+    install_failed="install-cron.sh failed, so no cron job was installed."
+fi
 MINUTES="$minutes" bash "$INSTALLER" \
-    || die "install-cron.sh failed, so the cron job is not installed. $CONFIG_FILE was written and is fine -- fix the reason above and run ./manual-setup/install-cron.sh."
+    || die "$install_failed $CONFIG_FILE was written and passed the test -- fix the reason above and run:
+  $(install_command)"
 
 echo
 echo "Setup complete. To change a setting, re-run this script; to remove the"

@@ -14,9 +14,9 @@ which ships on most desktop distributions (Ubuntu, Fedora, Debian, Mint, …).
 - **`auto-setup.sh`** — the quickest way in. Asks for your network settings,
   writes `config.env`, tests them by running `reconnect.sh` once, and installs
   the cron job if that test passes. Everything below can also be done by hand.
-- **`reconnect.sh`** — reads the SSID of the active Wi-Fi connection with
-  `nmcli`. If it already matches your target network, it does nothing. If it
-  does not, it reconnects: it makes sure the Wi-Fi radio is on, rescans for
+- **`reconnect.sh`** — reads the SSID of each active Wi-Fi connection with
+  `nmcli` (only the one on `WIFI_IFACE`, if you set it). If one already matches
+  your target network, it does nothing. If none does, it reconnects: it makes sure the Wi-Fi radio is on, rescans for
   nearby networks, and brings the connection up.
 - **`manual-setup/install-cron.sh`** — installs a cron entry that runs
   `reconnect.sh` every 5 minutes. It is idempotent, so you can re-run it safely
@@ -35,7 +35,7 @@ them from the checkout root as shown below. `reconnect.sh`, `auto-setup.sh`,
 
 - Linux with NetworkManager (`nmcli`). No minimum version is claimed, and none
   is enforced. On an `nmcli` too old to report a saved profile's configured SSID
-  (`nmcli -t -f 802-11-wireless.ssid connection show <name>`) the script falls
+  (`nmcli -t -f 802-11-wireless.ssid connection show id <name>`) the script falls
   back to reading the scan list, which still works — except for a hidden
   network, which never appears in a scan and would then look permanently
   disconnected. If you use `WIFI_HIDDEN="yes"` and see `Wifi Reconnected` on
@@ -73,18 +73,37 @@ cd gen-InternetReconnector
 which Wi-Fi device to use (chosen from the ones `nmcli` reports, or left
 automatic), whether the network is hidden, and how often to run. It then writes
 `config.env` at mode `600`, runs `reconnect.sh` once to check the answers, and
-installs the cron job only if that run succeeds — so a wrong password is caught
-while you are still watching, rather than becoming a `FAIL` line every five
-minutes with the reason going to `/dev/null`. "Succeeds" is judged by the log
-line that run writes, not by its exit status alone: if a scheduled run is still
-in progress the test steps aside (`Skipped (already running)`, which is not a
+installs the cron job only if that run succeeds — so a setting that run uses and
+finds wrong is caught while you are still watching, rather than becoming a
+`FAIL` line every five minutes with the reason going to `/dev/null`. The
+password is tested only if that run has to connect without a working saved
+profile: if the machine is already on the network the run logs `Wifi Good`
+without trying it (the script then says so), and a reconnect through a saved
+NetworkManager profile does not use it either. A wrong password then shows up
+only later, as `FAIL`, if a reconnect ever has to fall back to it.
+
+"Succeeds" is judged by the log line that run writes, not by its exit status
+alone: if a scheduled run is still in progress the test steps aside (`Skipped (already running)`, which is not a
 test), and if the run wrote no new line — the log directory could not be
 created, or today's log file could not be written to — nothing was confirmed.
-In both cases the job is not installed and the script says to re-run. Only a
-line appended by that run counts; an older line already in the file does not.
+In both cases the job is not installed and the script says to re-run. Only the
+outcome that run itself logged counts: an older line already in the file, or one
+the scheduled job appends while the test is running, does not.
+
+A re-run over a job that is already installed is refused the same way, and
+because that job reads the same `config.env`, a refusal also undoes the write:
+the previous `config.env` is put back from `config.env.bak` (or a new one is
+removed again), so the installed job keeps the settings it had rather than
+starting to log `FAIL` on the ones just refused. With no job installed the new
+`config.env` is kept, and a re-run offers its values as the defaults.
 
 Re-run it any time to change a setting: each current value is offered as the
-default, the interval already installed is kept unless you give a new one, and
+default (Enter keeps it; type `-` at the password or interface prompt to clear
+a stored password or go back to letting NetworkManager pick the device), the interval already installed is kept unless you give a new one (one
+the installer would not keep is reported instead, and Enter then means every 5
+minutes: a hand-edited `*/7` it would refuse, a schedule that is not
+every-N-minutes such as `0,30 * * * *`, or a line edited past what it
+recognises as its own, which it leaves in place beside the new one), and
 the previous `config.env` is saved as `config.env.bak` — at mode `600`, whatever
 mode the original had, since it holds the same password. Any `RECONNECT_*`
 setting already on the installed cron line — a custom config path or log
@@ -97,8 +116,12 @@ Anything you set in the environment rather than type — `RECONNECT_CONFIG`,
 settings — is checked before the first question, against the same rules
 `install-cron.sh` applies, and so are whether `config.env` can actually be read
 and written (and, if it already exists, whether the backup can be written
-beside it), whether the checkout's own path can be written onto a cron line,
-and whether `crontab` is installed at all.
+beside it), whether the log directory — the default `logs/` as well as a
+`RECONNECT_LOG_DIR` — and today's log file in it can be written (a day log left
+by an earlier `sudo ./reconnect.sh` cannot), whether the checkout's own path can
+be written onto a cron line,
+whether `crontab` is installed and your crontab can be read, and whether the
+commands `install-cron.sh` needs (`mktemp`, `awk`, `rm`, `date`) are there.
 The checkout path is checked first, so a checkout under a directory that
 cannot be installed from is refused as that rather than as a bad config path.
 For the two path settings that means both rules the installer has: the path must
@@ -255,11 +278,20 @@ every interval while running `./reconnect.sh` by hand kept working.
 `install-cron.sh` checks for this at install time and prints the exact command
 to re-run, so you should not have to work it out yourself.
 
+`CRON_PATH` replaces the `PATH` rather than adding to it, so it has to reach
+`bash` as well: the job starts `reconnect.sh` through `#!/usr/bin/env bash`, and
+a `PATH` naming only `nmcli`'s directory would stop every run before it could
+write a log line. `install-cron.sh` warns about that too.
+
 `RECONNECT_CONFIG` and `RECONNECT_LOG_DIR` must be absolute paths when you set
 them for the installer, which refuses a relative one. Cron runs the job with
 your home directory as its working directory rather than the checkout, so a
 relative path would not point where it points when you type it — the job would
 read a config file that is not there and log `FAIL` every interval.
+`install-cron.sh` also notes, after installing, a config the job could not read
+and a log directory it could never create or write: `reconnect.sh` treats the
+second as a warning, so such a job would run every interval without writing a
+single log line.
 
 For the same reason, `./manual-setup/uninstall-cron.sh --purge-logs` only takes the log
 directory off the cron line when the value there is absolute. If a line has been
@@ -349,19 +381,21 @@ named exactly `YYYY-MM-DD.log` are ever removed, so anything else you keep in
   installing, not from the defaults, and warns you whenever it exceeds your
   interval — so raising those settings can trigger the warning at an interval
   that was fine before, and lowering them can silence it at one that was not.
-- **A network or profile name that looks like an `nmcli` option is misread.**
-  `nmcli` has no end-of-options marker where `reconnect.sh` passes the profile
-  name (`connection show <name>`) and the SSID (`dev wifi connect <ssid>`), so a
-  name that `nmcli` reads as one of its own flags there — `--active`,
-  `--order`, `--ask`, `--show-secrets`, or a dashed prefix of one of those such
-  as `-a` — cannot be passed literally. Any other name, including one that
-  merely starts with `-`, goes through as written. (An earlier version put a
-  `--` in front of both, which `nmcli` took as the name itself; see
-  [DECISIONS.md](tests/DECISIONS.md) D6.)
+- **An SSID that looks like an `nmcli` option cannot use the password form.**
+  `nmcli` has no end-of-options marker where `reconnect.sh` passes the SSID to
+  the first connect (`dev wifi connect <ssid>`), so an SSID that `nmcli` reads
+  as one of its own flags there — `--ask`, `--show-secrets`, or a dashed prefix
+  of either — cannot be passed literally. Connect once through the desktop UI
+  instead: saved profiles are looked up and brought up by name with `nmcli`'s
+  `id` selector, which takes any name, including `--active` or `id`. Any other
+  SSID, including one that merely starts with `-`, goes through as written. (An
+  earlier version put a `--` in front, which `nmcli` took as the SSID itself;
+  see [DECISIONS.md](tests/DECISIONS.md) D6.)
 - **The overlap lock needs `flock`.** It comes from `util-linux` and is present
-  on ordinary Linux installs. Without it the lock is skipped and two runs at
-  once are possible again, which only matters at intervals short enough for a
-  run to outlast them.
+  on ordinary Linux installs. Without it — or where it cannot lock the file,
+  such as on an NFS mount without lock support, in which case a hand-run says
+  so on stderr — the lock is skipped and two runs at once are possible again,
+  which only matters at intervals short enough for a run to outlast them.
 - **Needs bash 4.0 or newer.** macOS ships bash 3.2 as `/bin/bash`, where
   `reconnect.sh` and `auto-setup.sh` stop with a clear message rather than
   running — `auto-setup.sh` before it asks you for anything, rather than after
@@ -372,8 +406,11 @@ named exactly `YYYY-MM-DD.log` are ever removed, so anything else you keep in
 
 ## Notes & troubleshooting
 
-- **Security:** your password lives only in `config.env` (mode `600`,
-  gitignored). Once you have connected successfully, NetworkManager stores the
+- **Security:** your password lives in `config.env` (mode `600`,
+  gitignored) and, once `auto-setup.sh` has been re-run over an existing
+  config, in the backup it keeps beside it, `config.env.bak` (also mode `600`
+  and gitignored). Delete both if you want it gone; `uninstall-cron.sh` touches
+  neither. Once you have connected successfully, NetworkManager stores the
   network in its own connection profile — the same as connecting through the
   desktop UI — and the script then reconnects with `nmcli connection up`, which
   needs no password. If you would rather not store the password at all, connect

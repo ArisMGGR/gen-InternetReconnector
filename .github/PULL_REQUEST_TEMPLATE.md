@@ -28,7 +28,9 @@ were:
 ## Checklist
 
 - [ ] New behaviour is documented in the README
-- [ ] No Wi-Fi password can reach a command line, a log file or an error message
+- [ ] No Wi-Fi password can reach a log file or an error message, nor a command
+      line other than the documented password-form connect in `reconnect.sh`
+      (see SECURITY.md)
 - [ ] New tests cover the change, where it is testable without NetworkManager
 - [ ] If this invalidates the reasoning behind a [DECISIONS.md](../tests/DECISIONS.md)
       entry, that entry is updated in the same pull request
