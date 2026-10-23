@@ -25,7 +25,9 @@ Worth understanding before you file a report:
 
 - If you set `WIFI_PASSWORD`, your Wi-Fi password is stored in `config.env`, in
   plaintext, on your own machine. Keep it at mode `600` (`chmod 600 config.env`).
-  It is gitignored.
+  It is gitignored. Re-running `auto-setup.sh` over an existing config also
+  keeps the previous one as `config.env.bak`, which holds the same password; it
+  is set to mode `600` and gitignored too, and it is yours to delete.
 - `WIFI_PASSWORD` is optional. If NetworkManager already has a saved profile for
   the SSID, `reconnect.sh` uses that profile and never needs the password, so you
   can leave the setting empty and keep the password out of `config.env`

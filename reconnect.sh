@@ -23,6 +23,15 @@
 
 set -euo pipefail
 
+# An exported CDPATH is cleared before the first `cd` below, in all four scripts
+# and the suite. `cd` searches CDPATH for a relative name that does not start
+# with `./` or `../`, and when it finds one there it prints the directory it
+# moved to -- into the `$(cd ... && pwd -P)` that is meant to hold nothing but
+# that directory. With CDPATH=. exported, `bash manual-setup/install-cron.sh`
+# got the path twice, joined by a newline, and died on the next `cd` naming a
+# directory that does not exist. Nothing in these scripts wants CDPATH.
+unset CDPATH
+
 # --- Resolve paths -----------------------------------------------------------
 # Resolve the directory this script lives in, so it works the same whether it
 # is invoked from cron, from an absolute path, or from the current directory.
@@ -48,7 +57,11 @@ case "$script_src" in
         ;;
     *) script_dir=. ;;
 esac
-SCRIPT_DIR="$(cd "$script_dir" && pwd)"
+#
+# `pwd -P`, as in the other three scripts: install-cron.sh, which writes the
+# cron line, gives the reason. Here it only keeps the default paths spelled the
+# way the line and auto-setup.sh's readback spell them.
+SCRIPT_DIR="$(cd "$script_dir" && pwd -P)"
 CONFIG_FILE="${RECONNECT_CONFIG:-$SCRIPT_DIR/config.env}"
 LOG_DIR="${RECONNECT_LOG_DIR:-$SCRIPT_DIR/logs}"
 LOG_RETENTION_DAYS="${RECONNECT_LOG_RETENTION_DAYS:-90}"
@@ -145,6 +158,21 @@ prune_logs() {
 # states the reason. auto-setup.sh's config write and the suite's nmcli stub
 # order theirs the same way for the same reason; this was the one of the three
 # that did not.
+#
+# IR_OUTCOME_FILE is not a setting; it is how auto-setup.sh learns what *its*
+# verification run logged. When it is set and the day-file append succeeded,
+# the outcome is also written there, overwriting it. auto-setup.sh used to read
+# the outcome back out of the shared day file instead, as the first line past
+# the count it took before the run -- and a scheduled run of the installed job
+# appends to that same file. One that stepped aside mid-verification put
+# "Skipped (already running)" ahead of the verification's own line, so a run
+# that had tested the settings was refused as untested; one that finished in
+# the instant before the verification found the lock held put its "Wifi Good"
+# ahead of the verification's "Skipped", and untested settings were installed
+# under "Settings work". Nothing but the verification run has this variable,
+# so nothing else can write to the file. Written only after the append, so an
+# empty file still means "this run could not log", and never allowed to fail
+# the run.
 status() {
     if ! mkdir -p "$LOG_DIR" 2>/dev/null; then
         echo "WARNING: cannot create log directory: $LOG_DIR" >&2
@@ -153,6 +181,8 @@ status() {
     if ! printf '[%s] %s\n' "$(date '+%H:%M:%S')" "$*" \
         2>/dev/null >> "$LOG_DIR/$(date '+%Y-%m-%d').log"; then
         echo "WARNING: cannot write to log directory: $LOG_DIR" >&2
+    elif [ -n "${IR_OUTCOME_FILE:-}" ]; then
+        printf '%s\n' "$*" 2>/dev/null > "$IR_OUTCOME_FILE" || true
     fi
     prune_logs
     return 0
@@ -240,11 +270,33 @@ fi
 # flock comes from util-linux and is not everywhere. Where it is missing the
 # lock is skipped and overlapping runs behave as they did before, which is why
 # install-cron.sh still warns about intervals shorter than the worst case.
+#
+# The descriptor is opened inside a guarded group, and a lock file that cannot
+# be opened is treated exactly like a missing flock: the lock is skipped and the
+# run goes on to record its outcome. The `exec` used to be bare, and `touch`
+# above succeeds on a *directory* -- so a `.lock` that was a directory (or any
+# other path `>>` cannot open) made `exec 9>>` fail under `set -e`: exit 1, a
+# bare "Is a directory" on stderr, and no log line at all, which breaks "each
+# run appends exactly one line". The `2>/dev/null` on the group is restored
+# when the group ends; the `exec` inside it is what makes descriptor 9 persist.
+#
+# Only flock's exit status 1 means "another run holds the lock". It used to be
+# any failure, and util-linux flock exits 1 only for a conflict: a lock the
+# filesystem cannot take (ENOLCK on an NFS mount without lockd, say) exits 71,
+# and other errors exit 65. Every one of those runs logged "Skipped (already
+# running)", exited 0 and never touched nmcli -- forever, since no other run
+# was holding anything -- and auto-setup.sh refused every verification as
+# "another run was still in progress". A lock that cannot be taken is treated
+# like a missing flock now: the run says so on stderr and goes on unlocked,
+# which is the degradation DECISIONS.md D5 chose for that case.
 if command -v flock >/dev/null 2>&1 \
     && mkdir -p "$LOG_DIR" 2>/dev/null \
-    && touch "$LOG_DIR/.lock" 2>/dev/null; then
-    exec 9>>"$LOG_DIR/.lock"
-    if ! flock -n 9; then
+    && touch "$LOG_DIR/.lock" 2>/dev/null \
+    && [ -f "$LOG_DIR/.lock" ] \
+    && { exec 9>>"$LOG_DIR/.lock"; } 2>/dev/null; then
+    flock_rc=0
+    flock -n 9 || flock_rc=$?
+    if [ "$flock_rc" -eq 1 ]; then
         # Log the skip rather than exiting silently. "Each run appends exactly
         # one line" is relied on when reading a day's log back: a run that
         # vanished without trace is indistinguishable from cron not having
@@ -252,6 +304,9 @@ if command -v flock >/dev/null 2>&1 \
         status "Skipped (already running)"
         echo "NOTE: another reconnect.sh run is still in progress; skipping." >&2
         exit 0
+    elif [ "$flock_rc" -ne 0 ]; then
+        exec 9>&-
+        echo "WARNING: flock could not lock $LOG_DIR/.lock (exit $flock_rc); running without the overlap lock." >&2
     fi
 fi
 
@@ -367,6 +422,44 @@ load_config() {
         # here, independently of what the prefix handling does.
         key="${key#"${key%%[![:space:]]*}"}"
         key="${key%"${key##*[![:space:]]}"}"
+        # A "key" that is not a plain setting name is never echoed back. The
+        # missing-'=' error below refuses to print its line because that line
+        # is most likely a mistyped password line -- but a password that itself
+        # contains '=' (a base64-style one ending in `==`, say) does not land
+        # there. `WIFI_PASSWORD "s3cr3tB64/Q=="` has an '=', so everything left
+        # of it became the key, and the unknown-setting error printed
+        # `unknown setting 'WIFI_PASSWORD "s3cr3tB64/Q'` -- nearly the whole
+        # password, on stderr, in the output the bug-report template asks
+        # people to paste. A real setting name is letters, digits and `_`, so
+        # anything else is reported by line number alone. The empty key is left
+        # to the unknown-setting arm, which prints '' and so shows nothing.
+        #
+        # Both checks here sit ahead of the duplicate check, whose message
+        # names the key too.
+        case "$key" in
+            '') ;;
+            [!A-Za-z_]* | *[!A-Za-z0-9_]*)
+                die "$CONFIG_FILE line $lineno: unknown setting (the text before the '=' is not a setting name, so it is not shown -- it may be part of a mistyped password line). Valid settings: WIFI_SSID, WIFI_PASSWORD, WIFI_IFACE, WIFI_HIDDEN." ;;
+        esac
+        # The same leak with no separator at all. A password typed straight
+        # after its name -- `WIFI_PASSWORDs3cr3tB64Q==`, or `WIFI_PASSWORD_hunter2=x`
+        # -- is letters, digits and `_` up to its first '=', so it passed the
+        # test above as a plain name and the unknown-setting arm below printed
+        # `unknown setting 'WIFI_PASSWORDs3cr3tB64Q'`: the password, short of its
+        # padding. A key that *begins* with a setting name and runs on past it is
+        # therefore reported by line number too. Uppercased for the comparison,
+        # so a lowercase `wifi_passwordhunter2` is caught as well; an exact name
+        # in the wrong case is not caught here and still reaches the arm below,
+        # which is right, because that is a visible typo with nothing after it.
+        #
+        # What this still cannot see is a password glued to a *misspelt* name
+        # (`WIFI_PASWORDhunter2`): telling that from an ordinary typo would mean
+        # never naming an unknown key, which is what makes WIFI_TYPO obvious.
+        case "${key^^}" in
+            WIFI_SSID | WIFI_PASSWORD | WIFI_IFACE | WIFI_HIDDEN) ;;
+            WIFI_SSID?* | WIFI_PASSWORD?* | WIFI_IFACE?* | WIFI_HIDDEN?*)
+                die "$CONFIG_FILE line $lineno: unknown setting (the text before the '=' starts with a setting name and runs on past it, so it is not shown -- it may be a password typed without its '='). Valid settings: WIFI_SSID, WIFI_PASSWORD, WIFI_IFACE, WIFI_HIDDEN." ;;
+        esac
         value="$(config_value "${line#*=}")"
         # A key set twice was silently accepted and the last line won. That is
         # the same silent-wrong-value outcome rejecting unknown keys exists to
@@ -578,12 +671,20 @@ function tfield(s, want,   i, c, n, cur) {
 }
 '
 
-# --- Determine the currently active Wi-Fi SSID -------------------------------
+# --- Is this machine already on the target network? --------------------------
 # Read the SSID from the *active connection profile*, not from the scan list.
 # A hidden network is connected but never appears in a scan, so reading the
 # scan list made it look permanently disconnected: the script took the
 # reconnect path on every single run and logged "Wifi Reconnected" forever.
-active_wifi_profile() {
+#
+# Every active Wi-Fi profile, not just the first. This used to `exit` after
+# the first line, so on a machine with two Wi-Fi connections up at once and
+# WIFI_IFACE left empty -- the README's default -- a target listed second was
+# never seen: every run logged "Wifi Reconnected" and ran `connection up` on a
+# connection that was already up, which re-activates it, so the target dropped
+# briefly every interval. Reading to the end also keeps the awk from closing the
+# pipe early, for the reason install-cron.sh's classify() gives.
+active_wifi_profiles() {
     run_nmcli -t -f NAME,TYPE,DEVICE connection show --active 2>/dev/null \
         | WANT_IFACE="$WIFI_IFACE" awk "$AWK_TERSE"'
             BEGIN { iface = ENVIRON["WANT_IFACE"] }
@@ -592,40 +693,39 @@ active_wifi_profile() {
                 if (type != "802-11-wireless" && type != "wifi") next
                 if (iface != "" && tfield($0, 3) != iface) next
                 print tfield($0, 1)
-                exit
             }'
 }
 
 # The SSID a saved profile is configured for. Empty for a non-Wi-Fi profile,
 # or on an nmcli too old to filter by property.
 #
-# The name is passed bare, with no `--` in front of it, and that is deliberate:
-# nmcli does not treat `--` as an end-of-options marker here. Its argument
-# walker (`next_arg()` in src/nmcli/utils.c) only consumes what
-# `nmc_arg_is_option()` recognises, and that returns false for a bare `--`, so
-# `connection show -- NAME` looked up a profile literally called `--`, failed
-# with "no such connection profile", and this function returned empty for
-# *every* profile -- which meant saved_profile_for_ssid() never found one and
-# every reconnect fell through to the password form and failed there too (see
-# connect_with_password(), which had the same `--` and the worse half of the
-# consequence). Checked against NetworkManager 1.10.6 through main; the only
-# `--` nmcli understands anywhere is `connection add`'s option/property
-# separator. The test suite's nmcli stub used to strip a `-- ` here, which is
-# why a green suite never noticed.
+# The name follows the `id` selector, the same one connect_saved() uses for
+# `connection up`. In do_connections_show() (src/nmcli/connections.c) the
+# options -- `--active`, `--order` and the global `--ask`/`--show-secrets` --
+# are read by next_arg() up to the first argument that is not one; a word `id`
+# there is taken as the selector and the argument after it is consumed as the
+# name with no option parsing at all. So a profile called `--active` or `-a`, or
+# one called `id`, `uuid`, `path`, `filename` or `apath` (the selector words
+# themselves), is looked up as the name it is.
 #
-# The cost of the bare name is the one DECISIONS.md D6 records: this position
-# genuinely takes options (`--active`, `--order`), so a profile whose name is a
-# prefix of one of those (`-a`, `--act`) is read as the option. That is a
-# documented limitation, not something a `--` can buy back.
+# Bare, it was not. A bare name in this position went through the option loop
+# first, so `--active` or a dashed prefix of an option was read as that option,
+# and a selector word was read as the selector, which then wanted another
+# argument. Such a profile was never found, and every reconnect for it fell
+# through to the password form. A `--` in front did not help either -- nmcli
+# has no end-of-options marker here, so `connection show -- NAME` looked up a
+# profile literally called `--`, and every real lookup failed (DECISIONS.md
+# D6) -- while the suite's stub, which stripped a `-- `, stayed green. The stub
+# now answers only the `id` spelling, so a lookup without it finds nothing.
 profile_ssid() {
-    run_nmcli -t -f 802-11-wireless.ssid connection show "$1" 2>/dev/null \
+    run_nmcli -t -f 802-11-wireless.ssid connection show id "$1" 2>/dev/null \
         | awk "$AWK_TERSE"'NR == 1 { print tfield($0, 2) }'
 }
 
 # Fallback for an nmcli that cannot report the active profile's SSID. Only
 # sees networks present in the scan list, which is why it is the fallback.
 #
-# Scoped to WIFI_IFACE when one is set, the same way active_wifi_profile() is.
+# Scoped to WIFI_IFACE when one is set, the same way active_wifi_profiles() is.
 # `dev wifi` lists access points across every Wi-Fi device, so on a machine with
 # two adapters this fallback could report an SSID that is active on the *other*
 # one -- and if that happened to be the target, the run logged "Wifi Good"
@@ -638,27 +738,34 @@ scan_list() {
     fi
 }
 
-scanned_ssid() {
+# Every SSID the scan list marks active, for the reason active_wifi_profiles()
+# prints every profile: with two adapters up, the target may not come first.
+scanned_active_ssids() {
     scan_list ACTIVE,SSID \
-        | awk "$AWK_TERSE"'tfield($0, 1) == "yes" { print tfield($0, 2); exit }'
+        | awk "$AWK_TERSE"'tfield($0, 1) == "yes" { print tfield($0, 2) }'
 }
 
-current_ssid() {
-    local profile ssid
-    profile="$(active_wifi_profile || true)"
-    if [ -n "$profile" ]; then
+# True when any active Wi-Fi connection (on WIFI_IFACE, when set) is on the
+# target SSID. The scan list is consulted only when no active profile reported
+# an SSID at all -- none is up, or nmcli is too old to say -- which is the case
+# the fallback has always been for.
+on_target() {
+    local profile ssid resolved=0
+    while IFS= read -r profile; do
+        [ -n "$profile" ] || continue
         ssid="$(profile_ssid "$profile" || true)"
-        if [ -n "$ssid" ]; then
-            printf '%s\n' "$ssid"
-            return 0
-        fi
-    fi
-    scanned_ssid
+        [ -n "$ssid" ] || continue
+        resolved=1
+        [ "$ssid" != "$WIFI_SSID" ] || return 0
+    done < <(active_wifi_profiles || true)
+    [ "$resolved" -eq 0 ] || return 1
+    while IFS= read -r ssid; do
+        [ "$ssid" != "$WIFI_SSID" ] || return 0
+    done < <(scanned_active_ssids || true)
+    return 1
 }
 
-CURRENT="$(current_ssid || true)"
-
-if [ "$CURRENT" = "$WIFI_SSID" ]; then
+if on_target; then
     # Already on the target network -- nothing to do.
     status "Wifi Good"
     exit 0
@@ -774,10 +881,11 @@ saved_profile_for_ssid() {
 # No `--` here either. The profile name follows the `id` selector, which marks
 # the next argument as its value, so a name beginning with `-` is taken
 # literally on this path -- and `connection up id -- MyNet` would make `--` the
-# value of `id` and leave `MyNet` behind as a stray argument nmcli rejects. The
-# two bare positionals, profile_ssid() above and connect_with_password() below,
-# carried a `--` for a while on the belief that it would do for them what `id`
-# does here; it did not, for the reason profile_ssid()'s comment gives.
+# value of `id` and leave `MyNet` behind as a stray argument nmcli rejects.
+# profile_ssid() above takes its name the same way now. The one bare positional
+# left is the SSID in connect_with_password() below, which carried a `--` for a
+# while on the belief that it would do there what `id` does here; it did not,
+# for the reason that function's comment gives.
 connect_saved() {
     if [ -n "$WIFI_IFACE" ]; then
         run_nmcli -w "$NMCLI_WAIT_SECS" connection up id "$1" ifname "$WIFI_IFACE"
@@ -801,8 +909,9 @@ connect_with_password() {
     # keyword arguments appended below -- password, hidden, ifname -- each mark
     # their own value. What an SSID beginning with `-` costs on this path is
     # only that `--ask` or `--show-secrets` (or a dashed prefix of either) would
-    # be read as nmcli's own flag;
-    # DECISIONS.md D6 records it.
+    # be read as nmcli's own flag; DECISIONS.md D6 records it. `dev wifi
+    # connect` has no `id`-style selector for the SSID to hide behind, which is
+    # why this one stays bare while profile_ssid()'s name no longer is.
     cmd=(run_nmcli -w "$NMCLI_WAIT_SECS" dev wifi connect "$WIFI_SSID" password "$WIFI_PASSWORD")
     if [ "$WIFI_HIDDEN" = yes ]; then
         cmd+=(hidden yes)

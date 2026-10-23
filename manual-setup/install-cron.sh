@@ -8,10 +8,16 @@
 # Usage (from the checkout root):
 #   ./manual-setup/install-cron.sh            # install / update the every-5-minutes job
 #   ./manual-setup/install-cron.sh --remove   # remove the job
+#   ./manual-setup/install-cron.sh --remove-dry-run  # print what --remove would delete
 #   ./manual-setup/install-cron.sh --help     # show usage
 #   MINUTES=10 ./manual-setup/install-cron.sh # install with a different interval
 
 set -euo pipefail
+
+# For the reason written out in reconnect.sh: an exported CDPATH makes the `cd`
+# below print into the substitution that resolves this script's directory.
+# `bash manual-setup/install-cron.sh` is the spelling that reaches it.
+unset CDPATH
 
 # Split with parameter expansion rather than `dirname`, matching reconnect.sh,
 # where the same line runs before anything can report a failure and the reasoning
@@ -28,15 +34,31 @@ case "$script_src" in
         ;;
     *) script_dir=. ;;
 esac
-SCRIPT_DIR="$(cd "$script_dir" && pwd)"
+#
+# `pwd -P`, the physical path, in all four scripts. A plain `pwd` reports the
+# path the way it was reached, so a checkout reached through a symlink (a
+# symlinked home directory, or `~/ir -> /mnt/data/ir`) had two spellings, and
+# the cron line recorded whichever one the installer happened to be run through.
+# Re-installing through the other spelling then failed ours()' path test, called
+# this checkout's own line "a different copy of reconnect.sh", left it in place
+# and appended a second job -- two jobs for one checkout, on the re-install the
+# README calls idempotent. The physical path is the same whichever way in.
+SCRIPT_DIR="$(cd "$script_dir" && pwd -P)"
 # This script lives in manual-setup/, one level below the checkout root, and
 # everything it schedules or writes about lives at the root: reconnect.sh,
 # config.env, logs/, auto-setup.sh and tests/. The root is resolved once here
 # and used for all of them, so moving this directory again means changing one
 # line. Only install-cron.sh, uninstall-cron.sh and config.env.example sit
 # beside this file.
-ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd -P)"
 RECONNECT="$ROOT_DIR/reconnect.sh"
+# The spelling a plain `pwd` gives for the way this run reached the checkout.
+# Lines are only ever *written* with $RECONNECT, but a line an earlier version
+# wrote through a symlink names this spelling instead, and it is still this
+# checkout's line: matched as ours, so a re-install replaces it rather than
+# leaving it as "another copy" beside a new one. Equal to $RECONNECT whenever no
+# symlink is involved.
+RECONNECT_ALIAS="$(cd "$script_dir/.." && pwd)/reconnect.sh"
 MARKER="# InternetReconnector"          # tag used to find/replace our line
 
 # Left empty when the caller did not set it. The default is not applied here,
@@ -98,10 +120,12 @@ usage() {
     command -v cat >/dev/null 2>&1 \
         || die "cat not found. Install coreutils."
     cat <<'USAGE'
-Usage: install-cron.sh [--remove | --help]
+Usage: install-cron.sh [--remove | --remove-dry-run | --help]
 
   (no arguments)   Install or update the cron job that runs reconnect.sh.
   --remove         Remove the cron job.
+  --remove-dry-run Print the cron lines --remove would delete, one per line,
+                   and change nothing. uninstall-cron.sh --dry-run uses it.
   --help, -h       Show this message.
 
 Environment:
@@ -129,7 +153,9 @@ Environment:
                    RECONNECT_CONFIG and RECONNECT_LOG_DIR must be absolute
                    paths, and a relative one is refused. Cron runs the job from
                    your home directory rather than from this one, so a relative
-                   path would not point where it points when you type it.
+                   path would not point where it points when you type it. A
+                   config the job could not read, and a log directory it could
+                   never create or write, are noted after the install.
 
   CRON_PATH=P      The PATH written onto the cron line. Defaults to the
                    interval-style carry-over: whatever is on the installed line,
@@ -169,6 +195,7 @@ mode=install
 if [ "$#" -eq 1 ]; then
     case "$1" in
         --remove) mode=remove ;;
+        --remove-dry-run) mode=remove-dry-run ;;
         -h | --help) usage; exit 0 ;;
         *) usage >&2; die "unknown argument: '$1'" ;;
     esac
@@ -356,9 +383,21 @@ fi
 # command on PATH. The bracket expressions are a per-letter case fold rather than
 # `shopt -s nocasematch`, which would leave a global shell option set for the
 # rest of the run; the space between the words is literal, as it was under grep.
+#
+# The second arm is BusyBox's spelling of the same case. Its `crontab -l` just
+# opens the user's file in the spool directory and, when there is none, says
+# `crontab: can't open '<user>': No such file or directory` and exits 1 -- no
+# "no crontab" anywhere, so every first install on a BusyBox cron was refused
+# as a read failure, while the README says such a system otherwise works. Only
+# that exact shape is taken: the same message with any other reason (Permission
+# denied, say) is a real read failure and is still refused, and a spool
+# directory that is missing fails earlier with "can't change directory". This
+# is matched on BusyBox's source, not on a run against a real BusyBox cron.
+# uninstall-cron.sh and auto-setup.sh recognise the same two shapes.
 mentions_no_crontab() {
     case "$1" in
         *[Nn][Oo]" "[Cc][Rr][Oo][Nn][Tt][Aa][Bb]*) return 0 ;;
+        *"can't open '"*"': No such file or directory"*) return 0 ;;
         *) return 1 ;;
     esac
 }
@@ -424,18 +463,47 @@ function marked(line,   ml) {
     ml = length(marker)
     return length(line) >= ml && substr(line, length(line) - ml + 1) == marker
 }
-function ours(line,   i, n, f) {
-    if (!marked(line)) return 0
-    if (index(line, quoted_target) > 0) return 1
+function names_target(line,   i, n, f) {
+    if (index(line, quoted_target) > 0 || index(line, quoted_alias) > 0) return 1
     n = split(line, f, /[[:space:]]+/)
     for (i = 1; i <= n; i++)
-        if (f[i] == target) return 1
+        if (f[i] == target || f[i] == alias) return 1
     return 0
+}
+function ours(line) {
+    return marked(line) && names_target(line)
+}
+# The reconnect.sh of this checkout in double quotes, the one spelling a
+# hand-edit produces that names_target() does not accept. Never used to claim a
+# line, only to tell an edited line of ours from a line of another checkout.
+# (No apostrophes in these comments: this program sits inside single quotes.)
+function names_target_dq(line) {
+    return index(line, dq_target) > 0 || index(line, dq_alias) > 0
+}
+# Runs the reconnect.sh of this checkout and carries the marker, but was edited
+# by hand past what ours() accepts: text added after the marker ("... #
+# InternetReconnector # my note"), or the path put in double quotes. Such a line
+# is not claimed -- a command of the user can mention the marker mid-line, and
+# deletion must never take a line it cannot be sure it wrote -- but it is not
+# ignored either. Text after the marker used to make it neither ours nor
+# foreign, so a re-install appended a second job beside it without a word.
+# Double quotes made it "foreign": the note called the own line of this
+# checkout "a different copy of reconnect.sh" and said to run --remove from
+# that copy -- advice that cannot work, because this is that copy. Both are
+# reported as what they are now; see warn_about_edited().
+function edited(line) {
+    if (line ~ /^[[:space:]]*#/) return 0
+    if (index(line, marker) == 0 || ours(line)) return 0
+    return names_target(line) || names_target_dq(line)
 }
 BEGIN {
     marker = ENVIRON["MARKER"]
     target = ENVIRON["RECONNECT"]
     quoted_target = sprintf("%c%s%c", 39, target, 39)
+    alias = ENVIRON["RECONNECT_ALIAS"]
+    quoted_alias = sprintf("%c%s%c", 39, alias, 39)
+    dq_target = sprintf("%c%s%c", 34, target, 34)
+    dq_alias = sprintf("%c%s%c", 34, alias, 34)
 }
 '
 
@@ -459,7 +527,8 @@ BEGIN {
 #
 # has_entries() had the same defect in a worse place -- see its comment.
 classify() {
-    printf '%s\n' "$2" | MARKER="$MARKER" RECONNECT="$RECONNECT" awk "$CLASSIFY_AWK$1"
+    printf '%s\n' "$2" | MARKER="$MARKER" RECONNECT="$RECONNECT" \
+        RECONNECT_ALIAS="$RECONNECT_ALIAS" awk "$CLASSIFY_AWK$1"
 }
 
 # True when the crontab text contains a line of ours.
@@ -485,9 +554,18 @@ our_line() {
 }
 
 # Marked lines that belong to a different checkout. Reported, never removed.
+# A line of this checkout's that a hand-edit took past ours() is edited, not
+# foreign, and is reported by warn_about_edited() instead.
 # shellcheck disable=SC2016
 foreign_lines() {
-    classify 'marked($0) && !ours($0) { print }' "$1"
+    classify 'marked($0) && !ours($0) && !edited($0) { print }' "$1"
+}
+
+# Lines of this checkout's that a hand-edit took past what ours() recognises.
+# Reported, never removed -- see edited() in CLASSIFY_AWK.
+# shellcheck disable=SC2016
+edited_lines() {
+    classify 'edited($0) { print }' "$1"
 }
 
 # Everything that is not one of our lines. Blank lines are kept: this is the
@@ -600,6 +678,52 @@ warn_about_foreign() {
     fi
 }
 
+# Warn about lines of ours that a hand-edit took past ours(). $2 is what this
+# run did about the job, so the note says what that means: on an install there
+# are now two jobs running this script; on a removal the edited one is still
+# there. Same one-printf-per-line rule as warn_about_foreign().
+warn_about_edited() {
+    local edited line
+    edited="$(edited_lines "$1")"
+    [ -n "$edited" ] || return 0
+    echo "NOTE: these cron lines run this checkout's reconnect.sh and carry our" >&2
+    echo "      marker, but were edited by hand (text added after the marker, or" >&2
+    echo "      the path put in double quotes), so they are not recognised as this" >&2
+    echo "      script's own and were left untouched:" >&2
+    while IFS= read -r line; do
+        printf '        %s\n' "$line" >&2
+    done <<< "$edited"
+    case "$2" in
+        install)
+            echo "      The job was installed as well, so reconnect.sh now runs from both." >&2
+            echo "      Remove one with 'crontab -e'." >&2
+            ;;
+        *)
+            echo "      It still runs. Remove it by hand with 'crontab -e'." >&2
+            ;;
+    esac
+}
+
+# --- What --remove would delete ----------------------------------------------
+# uninstall-cron.sh --dry-run reports what an uninstall would do, and it used to
+# answer "Would remove the cron job" off its own deliberately loose matcher (D7)
+# -- so over a line edited after the marker it promised a removal that the real
+# run, which goes through ours() below, then declined: "nothing to remove", the
+# "still installed" WARNING and exit 1. A prediction of what is deleted has to
+# use the rule that deletes, so this prints exactly the lines --remove takes and
+# nothing else: no notes, nothing written. Same preflights and the same guarded
+# read as --remove, and never a date check, because nothing here is installed.
+# shellcheck disable=SC2016
+if [ "$mode" = remove-dry-run ]; then
+    would_remove=""
+    would_rc=0
+    would_remove="$(classify 'ours($0) { print }' "$current")" || would_rc=$?
+    [ "$would_rc" -eq 0 ] \
+        || die "could not classify the current crontab (awk exited $would_rc). Nothing was changed."
+    [ -z "$would_remove" ] || printf '%s\n' "$would_remove"
+    exit 0
+fi
+
 # --- Remove ------------------------------------------------------------------
 if [ "$mode" = remove ]; then
     if has_ours "$current"; then
@@ -609,6 +733,7 @@ if [ "$mode" = remove ]; then
         echo "No InternetReconnector cron job found for $RECONNECT; nothing to remove."
     fi
     warn_about_foreign "$current"
+    warn_about_edited "$current" remove
     exit 0
 fi
 
@@ -626,52 +751,8 @@ case "$RECONNECT" in
     *$'\n'* | *$'\r'*) die "the install path contains a line break, which would end the cron line early and leave the rest of the path in the crontab as a separate entry: $RECONNECT" ;;
 esac
 
-# Only after the path has been vetted, and only if it is actually needed: this
-# writes to the user's checkout, so it should not happen on a run that is about
-# to abort anyway.
-#
-# The failure is reported rather than left to `set -e`. A read-only checkout, or
-# one owned by another user, makes chmod fail -- and without the `|| die` that
-# aborted the script with no message at all, which is a miserable thing to debug
-# for what is really a one-line permissions problem.
-# Every script the documentation tells you to run directly, not just
-# reconnect.sh. The cron line only needs that one, but the README tells the user
-# to run ./uninstall-cron.sh later and ./tests/run-tests.sh before proposing a
-# change, and a checkout that arrived without its permission bits -- a zip
-# download, a filesystem with no execute bit, a clone taken before the committed
-# modes were fixed -- leaves those failing with "Permission denied" long after
-# this script has run. The list covered three of those four for no reason anybody
-# had written down, which is the shape an oversight takes once the reasoning
-# beside it is stated in full. auto-setup.sh joined the list when it was added,
-# on the same rule: the README tells you to run it directly, so it needs its bit
-# set for the same reason the other three do.
-#
-# A script that is not there is skipped, so a checkout without the test suite is
-# not a failure. The two cron scripts sit beside this file; the other three sit
-# at the checkout root.
-for script in "$RECONNECT" "$SCRIPT_DIR/install-cron.sh" \
-    "$SCRIPT_DIR/uninstall-cron.sh" "$ROOT_DIR/auto-setup.sh" \
-    "$ROOT_DIR/tests/run-tests.sh"; do
-    [ -f "$script" ] || continue
-    [ ! -x "$script" ] || continue
-    # Below both `continue`s, so it is reached only for a script that really
-    # does need its bit set. As a preflight up with crontab and mktemp this
-    # refused every install on a machine without `chmod`, including the ordinary
-    # case where the loop makes it this far for nothing -- a clone with its
-    # committed modes intact skips every iteration here and never calls `chmod`
-    # at all. That is a working install turned into "chmod not found", which is
-    # what the install-only gate on `date` and the conditional `rm` gate in
-    # uninstall-cron.sh exist to stop happening.
-    #
-    # It is still worth checking rather than leaving to `set -e` or to the
-    # `|| die` below, for the reason it was first added: the failure message
-    # there names a permissions problem, and on a machine with no chmod that
-    # would send the reader after something that is not wrong.
-    command -v chmod >/dev/null 2>&1 \
-        || die "chmod not found. Install coreutils ($script is not executable and cannot be made so)."
-    chmod +x "$script" \
-        || die "cannot make $script executable (check its owner and mode, and that the filesystem is writable)."
-done
+# The scripts' executable bits are set further down, once every value written
+# onto the line has been vetted -- see "Executable bits" below.
 
 # --- Environment carried on the cron line ------------------------------------
 # Cron runs with a minimal environment and no DBus/display context. nmcli needs
@@ -761,8 +842,9 @@ MINUTES=$((10#$MINUTES))
 # existing cron line does not read as if the user had just typed it.
 #
 # RECONNECT_CONFIG and RECONNECT_LOG_DIR are paths, not numbers, and are left
-# alone: the config file is warned about below if it does not exist, and the log
-# directory is created on demand.
+# alone here: both are noted after the install if the job could not use them --
+# the config if it is missing or unreadable, the log directory if it can never
+# be created or written.
 validate_setting() {
     local name="$1" value="$2" what="$3" min
     case "$name" in
@@ -781,8 +863,12 @@ validate_setting() {
             die "$what must be a whole number >= $min; got: '$value'" ;;
     esac
     # Ahead of the arithmetic, because the arithmetic is what silently accepts an
-    # over-wide value. The wording matches reconnect.sh's for the same setting, so
-    # the pair refuses the same values with the same reason. See fits_in_integer().
+    # over-wide value. The bound and the width rule are reconnect.sh's for the
+    # same setting, so the pair refuses the same values. The wording is the same
+    # for the two settings whose minimum is 1; for the two whose minimum is 0,
+    # reconnect.sh says "non-negative whole number of seconds/days" where this
+    # says ">= 0" -- the same rule in different words, and auto-setup.sh's
+    # check_setting() copies the wording used here. See fits_in_integer().
     fits_in_integer "$value" \
         || die "$what must be a whole number >= $min, at most 18 digits; got: '$value'"
     # Base 10 for the same reason validate_minutes() forces it: bash reads a
@@ -966,6 +1052,59 @@ done
 [ -n "$installed_attempts" ] || installed_attempts=3
 [ -n "$installed_nmcli_wait" ] || installed_nmcli_wait=20
 
+# --- Executable bits ---------------------------------------------------------
+# Only after every value written onto the line has been vetted, and only if it
+# is actually needed: this writes to the user's checkout, so it should not
+# happen on a run that is about to abort anyway. It used to sit straight after
+# the install-path check, ahead of the CRON_PATH and RECONNECT_* vetting above,
+# so `RECONNECT_CONNECT_ATTEMPTS=abc ./install-cron.sh` refused the value and
+# exited 1 having already chmodded the checkout. Still ahead of the crontab
+# write, though: a chmod that fails after the line is installed would leave a
+# job whose script cannot be started, which is worse than refusing.
+#
+# The failure is reported rather than left to `set -e`. A read-only checkout, or
+# one owned by another user, makes chmod fail -- and without the `|| die` that
+# aborted the script with no message at all, which is a miserable thing to debug
+# for what is really a one-line permissions problem.
+# Every script the documentation tells you to run directly, not just
+# reconnect.sh. The cron line only needs that one, but the README tells the user
+# to run ./uninstall-cron.sh later and ./tests/run-tests.sh before proposing a
+# change, and a checkout that arrived without its permission bits -- a zip
+# download, a filesystem with no execute bit, a clone taken before the committed
+# modes were fixed -- leaves those failing with "Permission denied" long after
+# this script has run. The list covered three of those four for no reason anybody
+# had written down, which is the shape an oversight takes once the reasoning
+# beside it is stated in full. auto-setup.sh joined the list when it was added,
+# on the same rule: the README tells you to run it directly, so it needs its bit
+# set for the same reason the other three do.
+#
+# A script that is not there is skipped, so a checkout without the test suite is
+# not a failure. The two cron scripts sit beside this file; the other three sit
+# at the checkout root.
+for script in "$RECONNECT" "$SCRIPT_DIR/install-cron.sh" \
+    "$SCRIPT_DIR/uninstall-cron.sh" "$ROOT_DIR/auto-setup.sh" \
+    "$ROOT_DIR/tests/run-tests.sh"; do
+    [ -f "$script" ] || continue
+    [ ! -x "$script" ] || continue
+    # Below both `continue`s, so it is reached only for a script that really
+    # does need its bit set. As a preflight up with crontab and mktemp this
+    # refused every install on a machine without `chmod`, including the ordinary
+    # case where the loop makes it this far for nothing -- a clone with its
+    # committed modes intact skips every iteration here and never calls `chmod`
+    # at all. That is a working install turned into "chmod not found", which is
+    # what the install-only gate on `date` and the conditional `rm` gate in
+    # uninstall-cron.sh exist to stop happening.
+    #
+    # It is still worth checking rather than leaving to `set -e` or to the
+    # `|| die` below, for the reason it was first added: the failure message
+    # there names a permissions problem, and on a machine with no chmod that
+    # would send the reader after something that is not wrong.
+    command -v chmod >/dev/null 2>&1 \
+        || die "chmod not found. Install coreutils ($script is not executable and cannot be made so)."
+    chmod +x "$script" \
+        || die "cannot make $script executable (check its owner and mode, and that the filesystem is writable)."
+done
+
 cron_line="*/$MINUTES * * * * $cron_env '$RECONNECT' >/dev/null 2>&1 $MARKER"
 
 # Recombine: keep the user's other entries, then append ours.
@@ -995,6 +1134,66 @@ if [ ! -e "$installed_config" ]; then
     echo "      log FAIL until you create one:" >&2
     echo "        cp '$SCRIPT_DIR/config.env.example' '$installed_config'" >&2
     echo "        chmod 600 '$installed_config'" >&2
+# Existence was the only thing this checked, and reconnect.sh refuses two more:
+# a config that is not a regular file and one it cannot read. Both produce the
+# same FAIL every interval with the reason going to /dev/null, and both passed
+# here in silence -- `RECONNECT_CONFIG=/etc/ir` naming the directory rather than
+# the file installed with exit 0 and no note. auto-setup.sh refuses both before
+# its interview; this script warns, for the reason it warns about a missing one.
+# `-r` is asked as the user running this script, which is the user the job runs
+# as, since the line goes into that user's crontab.
+elif [ ! -f "$installed_config" ]; then
+    echo >&2
+    echo "NOTE: $installed_config is not a regular file (a directory, say)," >&2
+    echo "      so every run will log FAIL. RECONNECT_CONFIG has to name the" >&2
+    echo "      config file itself; re-run this script with that path." >&2
+elif [ ! -r "$installed_config" ]; then
+    echo >&2
+    echo "NOTE: $installed_config cannot be read by you, and the job runs as you," >&2
+    echo "      so every run will log FAIL until you can read it. Check its owner" >&2
+    echo "      and mode." >&2
+fi
+
+# The log directory, for the same reason and with the same stance. reconnect.sh
+# creates it on demand, so a missing one is fine -- but one it cannot create, or
+# cannot write, is a warning there by design, and under cron that warning goes
+# to /dev/null: the job reconnects every interval and never writes a line, not
+# even FAIL, while the summary below names that directory as where the logs go.
+# auto-setup.sh refuses such a directory before its interview; this script said
+# nothing at all, so `RECONNECT_LOG_DIR=/var/log/ir ./install-cron.sh` installed
+# with exit 0 a job that could never log. Today's day file is checked too, as
+# auto-setup.sh checks it: one left by an earlier `sudo ./reconnect.sh` cannot be
+# appended to.
+#
+# The test is on the nearest ancestor that exists, which is exactly what
+# `mkdir -p` needs to be a writable directory. `-w` is a prediction, as it is
+# there; the point is the common case.
+log_dir_problem=""
+log_dir_probe="$installed_log_dir"
+while [ ! -e "$log_dir_probe" ]; do
+    case "$log_dir_probe" in
+        */*) log_dir_probe="${log_dir_probe%/*}"; [ -n "$log_dir_probe" ] || log_dir_probe=/ ;;
+        *) log_dir_probe=/ ;;
+    esac
+done
+if [ ! -d "$log_dir_probe" ]; then
+    log_dir_problem="$log_dir_probe exists and is not a directory"
+elif [ ! -w "$log_dir_probe" ]; then
+    log_dir_problem="$log_dir_probe is not writable"
+else
+    installed_day_log="$installed_log_dir/$(date '+%Y-%m-%d').log"
+    if [ -e "$installed_day_log" ] \
+        && { [ ! -f "$installed_day_log" ] || [ ! -w "$installed_day_log" ]; }; then
+        log_dir_problem="today's log file $installed_day_log cannot be written to"
+    fi
+fi
+if [ -n "$log_dir_problem" ]; then
+    echo >&2
+    echo "NOTE: the job cannot log to $installed_log_dir:" >&2
+    echo "      $log_dir_problem. reconnect.sh treats that as a warning" >&2
+    echo "      and carries on, and under cron the warning goes to /dev/null, so" >&2
+    echo "      every run would go unrecorded. Fix that, or re-run this script" >&2
+    echo "      with RECONNECT_LOG_DIR naming a directory you can write." >&2
 fi
 
 # --- Will the job be able to find nmcli? -------------------------------------
@@ -1081,7 +1280,57 @@ elif [ -n "$nmcli_dir" ]; then
     esac
 fi
 
+# --- Will the job start at all? ----------------------------------------------
+# The cron line runs reconnect.sh by path, and the kernel starts it through its
+# shebang, `#!/usr/bin/env bash` -- so `env` looks bash up on the PATH written
+# onto the line and nowhere else. The nmcli check above was the only one that
+# PATH got, and it is the narrower of the two: a CRON_PATH naming just the
+# directory nmcli lives in (`CRON_PATH=/opt/nm/bin`, a natural reading of "the
+# PATH written onto the cron line") passed it, installed with exit 0 and no
+# note, and every scheduled run then died in `env` with "'bash': No such file or
+# directory" before reconnect.sh had run a line. That is worse than the FAIL the
+# nmcli note warns about: reconnect.sh never starts, so it cannot write even
+# that, and logs/ stays empty while cron sends env's complaint to /dev/null.
+#
+# A warning, for the reason the nmcli one is. Empty and relative entries are
+# skipped: cron runs the job from the home directory, not from here, so testing
+# them from this directory would answer a different question.
+cron_path_has_bash() {
+    local rest="$CRON_PATH" entry
+    while [ -n "$rest" ]; do
+        case "$rest" in
+            *:*) entry="${rest%%:*}"; rest="${rest#*:}" ;;
+            *) entry="$rest"; rest="" ;;
+        esac
+        case "$entry" in /*) ;; *) continue ;; esac
+        if [ -f "$entry/bash" ] && [ -x "$entry/bash" ]; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+if ! cron_path_has_bash; then
+    bash_path="$(command -v bash 2>/dev/null || true)"
+    echo >&2
+    echo "NOTE: bash is missing from the PATH this job was installed with:" >&2
+    echo "        $CRON_PATH" >&2
+    echo "      reconnect.sh starts through '#!/usr/bin/env bash', which looks bash" >&2
+    echo "      up on that PATH alone, so every scheduled run would fail before it" >&2
+    echo "      could write a log line -- not even FAIL." >&2
+    case "$bash_path" in
+        /*/*)
+            echo "      Re-run this script with bash's directory included:" >&2
+            echo "        CRON_PATH='${bash_path%/*}:$CRON_PATH' ./manual-setup/install-cron.sh" >&2
+            ;;
+        *)
+            echo "      Re-run this script with a CRON_PATH that includes bash's directory." >&2
+            ;;
+    esac
+fi
+
 warn_about_foreign "$current"
+warn_about_edited "$current" install
 
 # A run that keeps failing waits SCAN_WAIT_SECS for the scan, then makes
 # CONNECT_ATTEMPTS attempts of up to two NMCLI_WAIT_SECS nmcli calls each (the

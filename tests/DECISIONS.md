@@ -89,7 +89,9 @@ are not dates, or a user reports the directory filling with them.
 
 **What a review sees:** `reconnect.sh` takes its lock only when `flock` is on
 `PATH`. Where it is missing, two runs can overlap exactly as they did before the
-lock existed.
+lock existed. The same holds where `flock` is present but cannot lock the file
+(any exit status other than 1, its "held by another run" status): the run
+warns on stderr and goes on unlocked rather than logging a skip.
 
 **Decision:** degrade to no lock rather than refuse to run or emulate a lock.
 
@@ -103,42 +105,54 @@ case, and the README lists the limitation.
 **Revisit when:** a supported platform ships without `flock`; or an overlap is
 reported that the interval warning did not predict.
 
-## D6 — the profile name and the SSID are passed to `nmcli` bare, with no `--`
+## D6 — the SSID is passed to `nmcli dev wifi connect` bare, with no `--`
 
-**What a review sees:** `profile_ssid()` runs `nmcli ... connection show NAME`
-and `connect_with_password()` runs `nmcli ... dev wifi connect SSID`, and a name
-that `nmcli` reads as one of its own options in that position (`--active`,
-`--order`, `--ask`, `--show-secrets`, or a dashed prefix of one of those such
-as `-a`) is misread.
+**What a review sees:** `connect_with_password()` runs `nmcli ... dev wifi
+connect SSID`, and an SSID that `nmcli` reads as one of its own options in that
+position (`--ask`, `--show-secrets`, or a dashed prefix of either) is misread.
 
-**Decision:** pass both bare, and document the names that cannot be used
+**Decision:** pass it bare, and document the names that cannot be used
 (README, "Limitations").
 
-**Reasoning:** `nmcli` has no end-of-options marker in either position. Its
-argument walker (`next_arg()` in `src/nmcli/utils.c`) consumes only what
-`nmc_arg_is_option()` recognises, and a bare `--` is not that, so
-`connection show -- NAME` looked up a profile literally called `--` and
-`dev wifi connect -- SSID` took `--` as the SSID and refused the real one as an
-extra argument. Checked against NetworkManager 1.10.6 through `main`; the only
-`--` `nmcli` understands anywhere is `connection add`'s option/property
-separator. An earlier version put a `--` in front of both, every real lookup
-and every real password connect failed, and the suite stayed green because its
-stub stripped the `--` itself. The stub no longer strips anything, and the
-suite pins the bare shape on an SSID beginning with `-`. `connection up id
-NAME` is different: `id` marks the next argument as its value, so that path
-takes any name.
+**Reasoning:** `nmcli` has no end-of-options marker there. Its argument walker
+(`next_arg()` in `src/nmcli/utils.c`) consumes only what `nmc_arg_is_option()`
+recognises, and a bare `--` is not that, so `dev wifi connect -- SSID` took
+`--` as the SSID and refused the real one as an extra argument. Checked against
+NetworkManager 1.10.6 through `main`; the only `--` `nmcli` understands
+anywhere is `connection add`'s option/property separator. An earlier version
+put a `--` in front, every real password connect failed, and the suite stayed
+green because its stub stripped the `--` itself. The stub no longer strips
+anything, and the suite pins the bare shape on an SSID beginning with `-`.
 
-**Revisit when:** `nmcli` grows a `--` (or an `id`-style selector) for
-`connection show` or `dev wifi connect`. Then it can be put back — on that
-release and later only, which means a version check.
+The profile name used to be in this entry too, passed bare to
+`connection show NAME`, on the belief that that position had no selector
+either. It has one: `connection show [id | uuid | path | apath] ID`, and in
+`do_connections_show()` the argument after `id` is consumed as the name with
+no option parsing. `profile_ssid()` uses `connection show id NAME` now, as
+`connect_saved()` always used `connection up id NAME`, so a profile called
+`--active`, `-a` or `path` is found like any other. This entry's own "revisit"
+condition already held for that half when it was written.
+
+**Revisit when:** `nmcli` grows a `--` or an `id`-style selector for the SSID
+in `dev wifi connect`. Then it can be used — on that release and later only,
+which means a version check.
 
 ## D7 — `uninstall-cron.sh` recognises our cron line more loosely than `install-cron.sh` does
 
 **What a review sees:** `install-cron.sh`'s `ours()` claims a line only when it
 is not a comment, ends with the marker, and names this checkout's
 `reconnect.sh` as a shell word; `uninstall-cron.sh`'s `our_cron_lines()` skips
-comments and then accepts the marker and the path as bare substrings anywhere.
-The two can disagree about a hand-edited line.
+comments and then accepts the marker anywhere on the line, with the path quoted
+or as a whole word. The two can disagree about a hand-edited line.
+
+The path used to be a bare substring too, and that was looser than this
+decision needs: it also matched another checkout whose absolute path merely
+ends in this one's (`/home/u/ir` inside `/mnt/backup/home/u/ir`), so the
+uninstaller reported that job as its own and `--purge-logs` read the other
+job's log directory off it and deleted its logs. The path rule is now exactly
+the one `install-cron.sh` applies (plus the double-quoted spelling), which
+keeps every line `--remove` would delete in the report. `auto-setup.sh` reads
+settings back off the line with the same rule.
 
 **Decision:** keep the two rules different, with the strict one deciding what
 is deleted and the loose one deciding what is reported.
