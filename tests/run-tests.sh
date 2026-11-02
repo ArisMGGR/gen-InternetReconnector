@@ -1984,6 +1984,10 @@ PATH="$fakeflock_bin:$PATH" NM_ACTIVE_PROFILE="MyNet" NM_PROFILES="MyNet|MyNet" 
 assert_eq "a lock path that is a directory does not end the run" "0" "$RC_STATUS"
 assert_eq "and the run still logs its outcome" "Wifi Good" "$RC_LOG"
 assert_not_contains "with no bash redirect diagnostic" "Is a directory" "$RC_OUT"
+# And it says so, as a flock that cannot lock does below. It used to go unlocked
+# in silence, which is how a root-owned `.lock` from a sudo run hid for good.
+assert_contains "and says it went on without the lock" \
+    "running without the overlap lock" "$RC_OUT"
 
 # The control: the same stub with an ordinary lock path takes the lock path
 # normally, so the case above is not passing because the lock block is dead.
@@ -1992,6 +1996,8 @@ PATH="$fakeflock_bin:$PATH" NM_ACTIVE_PROFILE="MyNet" NM_PROFILES="MyNet|MyNet" 
     run_reconnect "$d"
 assert_eq "an ordinary lock path still works with flock present" "Wifi Good" "$RC_LOG"
 assert_exists "and the lock file is created" "$d/logs/.lock"
+assert_not_contains "and no lock warning is printed" \
+    "running without the overlap lock" "$RC_OUT"
 
 # A flock that is present but cannot take the lock. util-linux flock exits 1
 # only for a conflict; a filesystem with no lock support (ENOLCK, an NFS mount
