@@ -272,8 +272,9 @@ fi
 # install-cron.sh still warns about intervals shorter than the worst case.
 #
 # The descriptor is opened inside a guarded group, and a lock file that cannot
-# be opened is treated exactly like a missing flock: the lock is skipped and the
-# run goes on to record its outcome. The `exec` used to be bare, and `touch`
+# be opened is treated like a flock that cannot lock: the lock is skipped with a
+# warning on stderr, and the run goes on to record its outcome. The `exec` used
+# to be bare, and `touch`
 # above succeeds on a *directory* -- so a `.lock` that was a directory (or any
 # other path `>>` cannot open) made `exec 9>>` fail under `set -e`: exit 1, a
 # bare "Is a directory" on stderr, and no log line at all, which breaks "each
@@ -289,24 +290,33 @@ fi
 # "another run was still in progress". A lock that cannot be taken is treated
 # like a missing flock now: the run says so on stderr and goes on unlocked,
 # which is the degradation DECISIONS.md D5 chose for that case.
-if command -v flock >/dev/null 2>&1 \
-    && mkdir -p "$LOG_DIR" 2>/dev/null \
-    && touch "$LOG_DIR/.lock" 2>/dev/null \
-    && [ -f "$LOG_DIR/.lock" ] \
-    && { exec 9>>"$LOG_DIR/.lock"; } 2>/dev/null; then
-    flock_rc=0
-    flock -n 9 || flock_rc=$?
-    if [ "$flock_rc" -eq 1 ]; then
-        # Log the skip rather than exiting silently. "Each run appends exactly
-        # one line" is relied on when reading a day's log back: a run that
-        # vanished without trace is indistinguishable from cron not having
-        # fired at all, which is the more alarming of the two explanations.
-        status "Skipped (already running)"
-        echo "NOTE: another reconnect.sh run is still in progress; skipping." >&2
-        exit 0
-    elif [ "$flock_rc" -ne 0 ]; then
-        exec 9>&-
-        echo "WARNING: flock could not lock $LOG_DIR/.lock (exit $flock_rc); running without the overlap lock." >&2
+#
+# A lock file that cannot be opened says so the same way. It used to be skipped
+# in silence while a failing flock warned, and the ordinary way to get one is a
+# `.lock` left root-owned by an earlier `sudo ./reconnect.sh`: `touch` fails on
+# it, and every later run went unlocked with nothing on a hand-run to say why.
+if command -v flock >/dev/null 2>&1; then
+    if mkdir -p "$LOG_DIR" 2>/dev/null \
+        && touch "$LOG_DIR/.lock" 2>/dev/null \
+        && [ -f "$LOG_DIR/.lock" ] \
+        && { exec 9>>"$LOG_DIR/.lock"; } 2>/dev/null; then
+        flock_rc=0
+        flock -n 9 || flock_rc=$?
+        if [ "$flock_rc" -eq 1 ]; then
+            # Log the skip rather than exiting silently. "Each run appends
+            # exactly one line" is relied on when reading a day's log back: a
+            # run that vanished without trace is indistinguishable from cron
+            # not having fired at all, which is the more alarming of the two
+            # explanations.
+            status "Skipped (already running)"
+            echo "NOTE: another reconnect.sh run is still in progress; skipping." >&2
+            exit 0
+        elif [ "$flock_rc" -ne 0 ]; then
+            exec 9>&-
+            echo "WARNING: flock could not lock $LOG_DIR/.lock (exit $flock_rc); running without the overlap lock." >&2
+        fi
+    else
+        echo "WARNING: cannot open the lock file $LOG_DIR/.lock (check its owner and mode); running without the overlap lock." >&2
     fi
 fi
 
